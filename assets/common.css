@@ -91,7 +91,7 @@
 
 @media screen and (max-width: 500px) {
   .header {
-    height: 120px;
+    height: 135px;
   }
   
   .header h1{
@@ -112,5 +112,24 @@
 
   .footer {
     height: 80px;
+  }
+
+  .content {
+    display: flex;
+    widows: 320px;
+    flex-wrap: wrap;
+    padding-left: 10px;
+    padding-right: 10px;
+    padding-top: 200px;
+  }
+  
+  .content img{
+    width:300px;
+    height: auto;
+  }
+  
+  .content .home_content_text{
+    padding-left: 10px;
+    padding-top: 50px;
   }
 }
