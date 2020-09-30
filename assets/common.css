@@ -39,7 +39,8 @@
 
 body {
   margin-bottom: 100px;
-  font-family: 'Roboto', sans-serif;
+  font-family: 'Roboto';
+  font-size: 22px;
 }
 
 .footer {
