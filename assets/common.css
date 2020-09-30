@@ -54,11 +54,6 @@
 
 .content {
   display: flex;
-  flex-wrap: wrap;
-  flex-direction: column;
-  justify-content: center;
-  vertical-align: top;
-  text-align: left;
   padding-left: 5%;
   padding-right: 5%;
   padding-top: 250px;
@@ -82,6 +77,11 @@
     padding-left: 80px;
     padding-right: 80px;
     padding-top: 250px;
+  }
+  
+  .content img{
+    width:300px;
+    height: auto;
   }
   
   .content .home_content_text{
@@ -114,6 +114,12 @@
 
   .content {
     display: flex;
+    widows: 320px;
+    flex-wrap: wrap;
+    flex-direction: column;
+    justify-content: center;
+    vertical-align: top;
+    text-align: left;
     padding-left: 10px;
     padding-right: 10px;
     padding-top: 200px;
