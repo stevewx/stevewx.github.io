@@ -58,8 +58,8 @@ body {
 
 .content {
   display: flex;
-  padding-left: 5%;
-  padding-right: 5%;
+  padding-left: 80px;
+  padding-right: 80px;
   padding-top: 250px;
 }
 
@@ -71,22 +71,8 @@ body {
 }
 
 .content .home_content_text{
-  padding-left: 10%;
-  padding-top: 7%;
-}
-
-@media screen and (min-width: 1250px) {
-  .content {
-    display: flex;
-    padding-left: 80px;
-    padding-right: 80px;
-    padding-top: 250px;
-  }
-  
-  .content .home_content_text{
-    padding-left: 100px;
-    padding-top: 80px;
-  }
+  padding-left: 100px;
+  padding-top: 80px;
 }
 
 @media screen and (max-width: 600px) {
