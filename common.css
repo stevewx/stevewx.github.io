@@ -55,3 +55,20 @@
   text-align: right;
   padding-right: 30px;
 }
+
+.content {
+  display: flex;
+  padding-left: 5%;
+  padding-right: 5%;
+  padding-top: 250px;
+}
+
+.content img{
+  width:300px;
+  height: auto;
+}
+
+.content .home_content_text{
+  padding-left: 10%;
+  padding-top: 7%;
+}
