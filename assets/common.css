@@ -57,8 +57,6 @@ body {
 }
 
 .content {
-  display: flex;
-  flex-direction: row;
   padding-left: 80px;
   padding-right: 80px;
   padding-top: 250px;
@@ -76,7 +74,7 @@ body {
   padding-top: 80px;
 }
 
-@media screen and (max-width: 800px) {
+@media (max-width: 800px) {
   .header h1{
     padding-left: 22px;
   }
