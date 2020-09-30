@@ -38,7 +38,6 @@
 }
 
 body {
-  margin-top: 200px;
   margin-bottom: 100px;
 }
 
@@ -55,6 +54,10 @@ body {
 .footer p{
   text-align: right;
   padding-right: 20px;
+}
+
+.content {
+  padding-top: 250px;
 }
 
 .home_content {
