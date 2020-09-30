@@ -57,7 +57,7 @@ body {
 }
 
 .content {
-  padding-top: 160px;
+  margin-top: 160px;
 }
 
 .home_content {
@@ -67,7 +67,7 @@ body {
   padding-top: 250px;
 }
 
-.home_content img{
+img{
   display: block;
   max-width:300px;
   width: auto;
