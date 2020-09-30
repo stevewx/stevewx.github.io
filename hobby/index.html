@@ -6,6 +6,63 @@
   <title>Xuan Wang</title>
   <meta charset="utf-8" name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="/assets/common.css">
+  <style>
+    .picture_gallary {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      grid-template-rows: repeat(10, 5vw);
+      grid-gap: 10px;
+    }
+
+    .picture_gallary:first-child{
+      grid-column-start: 1;
+      grid-column-end: 4;
+      grid-row-start: 1;
+      grid-row-end: 3;
+    }
+
+    .picture_gallary:nth-child(2){
+      grid-column-start: 4;
+      grid-column-end: 7;
+      grid-row-start: 1;
+      grid-row-end: 3;
+    }
+
+    .picture_gallary:nth-child(4){
+      grid-column-start: 1;
+      grid-column-end: 3;
+      grid-row-start: 3;
+      grid-row-end: 7;
+    }
+
+    .picture_gallary:nth-child(5){
+      grid-column-start: 3;
+      grid-column-end: 5;
+      grid-row-start: 3;
+      grid-row-end: 7;
+    }
+
+    .picture_gallary:nth-child(7){
+      grid-column-start: 5;
+      grid-column-end: 7;
+      grid-row-start: 3;
+      grid-row-end: 7;
+    }
+
+    .picture_gallary:nth-child(3){
+      grid-column-start: 1;
+      grid-column-end: 4;
+      grid-row-start: 7;
+      grid-row-end: 10;
+    }
+    .picture_gallary:nth-child(6){
+      grid-column-start: 4;
+      grid-column-end: 7;
+      grid-row-start: 7;
+      grid-row-end: 10;
+    }
+
+  </style>
 </head>
 
 <body>
