@@ -75,7 +75,7 @@ body {
   padding-top: 80px;
 }
 
-@media screen and (max-width: 600px) {
+@media screen and (max-width: 800px) {
   .footer {
     height: 80px;
   }
