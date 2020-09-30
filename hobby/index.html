@@ -7,29 +7,30 @@
   <meta charset="utf-8" name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="/assets/common.css">
   <style>
-    .picture_gallary {
-      display: flex;
-      flex-direction: row;
-      flex-wrap: wrap;
-      padding: 5px;
-    }
+    @media (min-width: 800px) {
+      .picture_gallary {
+        display: flex;
+        flex-direction: row;
+        flex-wrap: wrap;
+        padding: 5px;
+      }
 
-    .picture_gallary img{
-      margin: 5px;
-    }
+      .picture_gallary img{
+        margin: 5px;
+      }
 
-    .picture_gallary img:first-child {
-      display: block;
-      max-width:400px;
-      width: auto;
-      height: auto;
-    }
+      .picture_gallary img:first-child {
+        display: block;
+        max-width:400px;
+        width: auto;
+        height: auto;
+      }
 
-    .picture_gallary img:hover{
-      transform: scale(1.4);
-      transition: 1s;
+      .picture_gallary img:hover{
+        transform: scale(1.4);
+        transition: 1s;
+      }
     }
-
   </style>
 </head>
 
