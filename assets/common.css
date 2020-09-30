@@ -56,20 +56,21 @@ body {
   padding-right: 20px;
 }
 
-.content {
+.home_content {
+  display: flex;
   padding-left: 80px;
   padding-right: 80px;
   padding-top: 250px;
 }
 
-.content img{
+.home_content img{
   display: block;
   max-width:300px;
   width: auto;
   height: auto;
 }
 
-.content .home_content_text{
+.home_content .home_content_text{
   padding-left: 100px;
   padding-top: 80px;
 }
@@ -87,7 +88,7 @@ body {
     height: 80px;
   }
 
-  .content {
+  .home_content {
     display: flex;
     flex-wrap: wrap;
     flex-direction: column;
@@ -99,11 +100,11 @@ body {
     padding-top: 200px;
   }
 
-  .content img{
+  .home_content img{
     padding-left: 10px;
   }
   
-  .content .home_content_text{
+  .home_content .home_content_text{
     padding-left: 10px;
     padding-top: 30px;
   }
