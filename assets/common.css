@@ -12,10 +12,6 @@
   padding-left: 30px;
 }
 
-.header p{
-  padding-left: 30px;
-}
-
 .header ul {
   list-style-type: none;
   margin: 0;
@@ -89,7 +85,32 @@
   .content .home_content_text{
     padding-left: 100px;
     padding-top: 80px;
-    background-color: red;
   }
 
+}
+
+@media screen and (max-width: 500px) {
+  .header {
+    height: 120px;
+  }
+  
+  .header h1{
+    padding-left: 19px;
+  }
+  
+  .header ul {
+    list-style-type: none;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    padding-left: 5px;
+  }
+  
+  .header ul li a {
+    padding: 14px 18px;
+  }
+
+  .footer {
+    height: 80px;
+  }
 }
