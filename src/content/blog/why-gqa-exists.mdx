@@ -1,0 +1,210 @@
+---
+title: "Why GQA Exists: KV-Cache Math and the Unequal-Heads Problem"
+description: "The KV cache, not the parameters, is what blows up memory at long context and large batch. Grouped-Query Attention shrinks it by a clean factor — and the moment you implement it, the fused QKV projection and the attention kernel both have to learn that Q has more heads than K and V."
+date: 2024-04-15
+category: work
+author: Xuan Wang
+tags: ["gqa", "mqa", "kv-cache", "attention", "inference"]
+featured: false
+draft: false
+references:
+  - authors: "Ainslie et al., 2023"
+    title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"
+    url: "https://arxiv.org/abs/2305.13245"
+    note: "introduces GQA and the uptraining-from-MHA recipe"
+  - authors: "Shazeer, 2019"
+    title: "Fast Transformer Decoding: One Write-Head is All You Need"
+    url: "https://arxiv.org/abs/1911.02150"
+    note: "the original Multi-Query Attention"
+  - authors: "Dao, 2023"
+    title: "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning"
+    url: "https://arxiv.org/abs/2307.08691"
+    note: "fused, IO-aware attention; indexes shared K/V heads (MQA/GQA) rather than replicating them"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+Train a model and people obsess over parameter count. Then you go to *serve* it
+at long context with a healthy batch size, and a different number quietly eats
+all your HBM: the **KV cache**. It scales with sequence length and batch in a way
+the weights never do, and on a long-context decode workload it can dwarf the
+model itself. Grouped-Query Attention (GQA) is the standard answer — and it's a
+nice case study in how a one-line idea ("share the K/V heads") ripples straight
+into your fused projection layout and your attention kernel.
+
+<SceneFigure
+  scene="gqa-heads"
+  height={160}
+  caption="Multi-Head, Grouped-Query, and Multi-Query attention. Each query head needs a key/value head to attend to. MHA pairs them 1:1; GQA shares one K/V head across a group of query heads; MQA shares a single K/V head across all of them. Fewer K/V heads means a smaller cache."
+/>
+
+## What the KV cache actually is
+
+During autoregressive decode, every new token attends to *every previous token*.
+The keys and values for those previous tokens don't change, so you compute them
+once and keep them. That stored tensor — per layer, per attention head, over the
+whole sequence so far — is the KV cache. It's pure throughput optimization:
+without it, generating each new token means re-running the forward pass over the
+entire prefix, and the self-attention in that pass is $O(n^2)$ per step.
+The cache cuts that to $O(n)$ per step — the new token computes only its own
+query, then attends to the $n$ stored keys and values. Over a full $n$-token
+generation, that's the difference between $O(n^3)$ and $O(n^2)$ total.
+
+The catch is memory. Across a batch, the cache size is:
+
+$$
+\text{bytes} \;=\; 2 \cdot L \cdot H_{kv} \cdot d_{\text{head}} \cdot S \cdot B \cdot b_{\text{dtype}}
+$$
+
+where $L$ is the number of layers, $H_{kv}$ the number of **key/value** heads,
+$d_{\text{head}}$ the per-head dimension, $S$ the sequence length, $B$ the batch
+size, and $b_{\text{dtype}}$ the bytes per element (2 for fp16/bf16). The leading
+$2$ is the part everyone forgets: you store **both** K and V.
+
+Plug in real numbers. A 32-layer model, 32 heads, $d_{\text{head}}=128$, fp16,
+at 8K context and batch 16:
+
+$$
+2 \cdot 32 \cdot 32 \cdot 128 \cdot 8192 \cdot 16 \cdot 2 \;\approx\; 68.7\ \text{GB}
+$$
+
+That is *just the cache* — no weights, no activations. The figure is in decimal
+gigabytes ($10^9$ bytes), which works out to exactly 64 GiB; an 80 GB-class
+device (A100/H100) exposes about 80 GiB, so the cache alone eats roughly 80% of
+the memory, leaving little room for weights and activations. And notice what it scales with: linearly in both $S$ and
+$B$. Double the context, double the cache; double the batch, double the cache. The
+weights, meanwhile, sit at a fixed size no matter how long or how many sequences
+you serve. This is why at serving time the KV cache, not the parameter count, is
+usually what caps your batch size and your maximum context.
+
+## The lever: there are too many K/V heads
+
+Look back at the formula. $L$, $S$, $B$ are fixed by your model and workload.
+$d_{\text{head}}$ is baked into the architecture. The one term you can attack
+without retraining a different-shaped network is $H_{kv}$ — the number of *key/
+value* heads.
+
+In standard **Multi-Head Attention (MHA)**, every query head gets its own
+dedicated K/V head, so $H_{kv} = H_q = H$. That's the leftmost group in the
+animation: a clean 1:1 pairing. It's also the expensive end — the cache carries
+a full set of K and V for all $H$ heads.
+
+The observation behind the whole family of variants: at inference, the K and V
+projections are far less sensitive to head diversity than Q is. You can share
+them aggressively and lose surprisingly little.
+
+**Multi-Query Attention (MQA)** takes this to the limit (Shazeer, 2019): a
+*single* K/V head shared across **all** query heads. So $H_{kv} = 1$, and the
+cache shrinks by a factor of $H$. At our example that's 68.7 GB down to about
+2.1 GB — enormous. The cost is quality: collapsing all key/value information into
+one head removes representational capacity, and the GQA paper and follow-on work
+reported quality degradation and, in some setups, training instability with MQA.
+
+**Grouped-Query Attention (GQA)** is the middle ground (Ainslie et al., 2023).
+Partition the $H$ query heads into $G$ groups; each group shares one K/V head. So
+$H_{kv} = G$, with $1 \le G \le H$:
+
+$$
+G = H \;\Rightarrow\; \text{MHA}, \qquad G = 1 \;\Rightarrow\; \text{MQA}
+$$
+
+The cache shrinks by a factor of $H / G$. Pick $G = 8$ for $H = 32$ and the cache
+drops 4× — our running example goes from 68.7 GB down to about 17 GB — while
+quality stays within noise of full MHA. That's the sweet spot most modern open
+models ship with — enough K/V diversity to keep quality, few enough K/V heads to
+make long-context serving tractable. The middle group in the animation is
+exactly this: a few query heads fanning into each shared K/V head.
+
+A useful detail from the paper: you don't have to pretrain a GQA model from
+scratch. You can **uptrain** from an existing MHA checkpoint — mean-pool the K and
+V projection weights within each group to initialize the shared head, then
+fine-tune on a small fraction of the original compute. The grouped model recovers
+nearly all the quality for a fraction of the cost.
+
+## The systems catch: now Q, K, and V are different widths
+
+Here's where the "just share the K/V heads" idea stops being one line of math and
+starts touching real code. In MHA, the three projections are symmetric: Q, K, and
+V each produce $H \cdot d_{\text{head}}$ features. That symmetry is why
+implementations love a **fused QKV projection** — one big matmul that emits all
+three at once, then a clean reshape into three equal `[H, d_head]` blocks.
+
+GQA breaks the symmetry. Q still has $H$ heads, but K and V now have only $G$. The
+fused weight is no longer three equal slabs:
+
+$$
+W_{qkv} \in \mathbb{R}^{\,d_{\text{model}} \;\times\; (\,H + 2G\,)\,d_{\text{head}}}
+$$
+
+The output of that matmul has to be split **unevenly**: the first
+$H \cdot d_{\text{head}}$ columns are Q, the next $G \cdot d_{\text{head}}$ are K,
+the last $G \cdot d_{\text{head}}$ are V. Any code that assumed three equal thirds
+— weight-loading, tensor-parallel sharding, the reshape after the projection —
+has to be taught the new layout. This is the most common place GQA integrations
+break: a checkpoint converter or a TP split that still slices the fused weight
+into three equal pieces will silently scramble heads.
+
+```python
+# illustrative — not a real implementation
+# fused QKV with GQA: Q has H heads, K and V have G heads each
+qkv = x @ W_qkv                       # [B, S, (H + 2G) * d_head]
+q, k, v = qkv.split(
+    [H * d_head, G * d_head, G * d_head], dim=-1
+)
+q = q.view(B, S, H, d_head)           # H query heads
+k = k.view(B, S, G, d_head)           # G key heads
+v = v.view(B, S, G, d_head)           # G value heads
+```
+
+Under tensor parallelism it gets fussier still. With $N$ TP ranks you want each
+rank to own $H/N$ query heads **and** the matching $G/N$ K/V heads, so that a
+group never straddles two devices. The clean partition requires $G$ divisible by
+$N$; when $N > G$, implementations replicate the K/V head across ranks instead.
+That's a constraint that doesn't exist for MHA and that quietly limits which
+parallelism configurations are legal.
+
+## And the attention kernel has to broadcast
+
+The second half of the integration is the attention computation itself. Each
+query head needs a key/value head to attend against. In MHA the pairing is
+trivial: head $i$ uses K/V head $i$. In GQA, query head $i$ must use K/V head
+$\lfloor i / (H/G) \rfloor$ — its group's shared head. Several query heads now
+point at the **same** K and V.
+
+The naive way to make existing kernels work is to physically replicate each K/V
+head $H/G$ times so the tensors line up at $H$ heads again, then run ordinary
+MHA. That's correct, and it's what a `repeat_kv` helper does — but it throws away
+the entire memory win at compute time by re-materializing the full-size K and V.
+
+```python
+# illustrative — not a real implementation
+def repeat_kv(x, n_rep):                  # x: [B, S, G, d_head]
+    B, S, G, d = x.shape
+    if n_rep == 1:
+        return x
+    return (x[:, :, :, None, :]            # [B, S, G, 1, d]
+              .expand(B, S, G, n_rep, d)   # broadcast across the group
+              .reshape(B, S, G * n_rep, d))  # back to H heads
+```
+
+A real fused kernel does better. FlashAttention and the serving engines don't
+replicate; they **index**. Each query head reads its group's single K/V head
+directly from the small cache, so the cache stays at $G$ heads in memory and the
+group structure is just an index map inside the kernel. This is the right mental
+model: GQA's saving is real only if your attention path *reads* the shared head
+in place rather than expanding it back out. A correct-but-slow integration
+replicates; a good one indexes.
+
+## So what
+
+GQA is a tiny architectural idea with an outsized payoff, and the reason it
+matters is entirely about serving, not training accuracy:
+
+- The KV cache scales as $2 \cdot L \cdot H_{kv} \cdot d_{\text{head}} \cdot S \cdot B \cdot b_{\text{dtype}}$, linear in sequence length and batch — so at long context it, not the weights, sets your memory ceiling.
+- $H_{kv}$ is the one term you can shrink. MHA sets $H_{kv} = H$, MQA sets it to $1$, GQA sets it to $G$ and cuts the cache by $H/G$ while keeping quality near MHA.
+- The cost lands in the plumbing: the fused QKV weight becomes three *unequal* slabs of width $(H + 2G)\,d_{\text{head}}$, the clean tensor-parallel split wants $G$ divisible by the TP degree (replicating the K/V head when ranks outnumber it), and the attention kernel must index each shared K/V head across its group rather than replicate it.
+
+Get the head bookkeeping right in both the projection split and the kernel, and
+you turn a model whose cache devours an 80 GB GPU at 8K context into one that
+comfortably serves long sequences at a useful batch size — same parameters, a
+fraction of the cache.

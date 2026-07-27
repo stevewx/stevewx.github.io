@@ -1,0 +1,253 @@
+---
+title: "Async Sharded Checkpointing to Object Storage"
+description: "At scale, training failures are routine, not exceptional. This is the machinery that makes them survivable: shard the state across ranks, stage to local NVMe, upload to object storage in the background, and resume deterministically."
+date: 2025-05-20
+category: work
+author: Xuan Wang
+tags: ["checkpointing", "s3", "reliability", "distributed-training", "fault-tolerance"]
+featured: false
+draft: false
+references:
+  - title: "PyTorch Distributed Checkpoint (DCP)"
+    url: "https://docs.pytorch.org/docs/stable/distributed.checkpoint.html"
+    note: "sharded, re-shardable save/load"
+  - authors: "Rajbhandari et al., 2020"
+    title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"
+    url: "https://arxiv.org/abs/1910.02054"
+    note: "the distributed-optimizer state sharding this builds on"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+Run a large distributed training job for long enough and the question stops
+being *whether* it crashes and becomes *how often*, and *how much do you lose
+each time*. A CUDA out-of-memory on a single rank, an NCCL collective that hangs
+until the watchdog fires, a node that drops off the fabric, a spot instance
+reclaimed mid-step — at a few hundred or a few thousand accelerators, these are
+not rare events. They are the weather. Checkpointing is the umbrella, and the
+naive umbrella has a hole in it: writing multi-terabyte state to remote storage
+*synchronously* stalls every GPU in the job while the bytes flush.
+
+This post is about closing that hole — making checkpoints frequent enough to
+bound the loss, cheap enough that you can afford to take them often, and
+complete enough that resume actually reproduces the run.
+
+<SceneFigure
+  scene="checkpointing"
+  height={160}
+  caption="The failure weather at scale: OOM, NCCL timeouts, node loss, preemption. Checkpointing is what turns each red event from 'lose everything' into 'lose a few minutes'."
+/>
+
+## Why synchronous checkpointing is a bubble
+
+A modern training checkpoint is not small. For a large model with a ZeRO-style
+distributed optimizer, the state you must persist is roughly
+
+$$
+S \;=\; \underbrace{2P}_{\text{bf16 weights}} \;+\; \underbrace{4P}_{\text{fp32 master}} \;+\; \underbrace{8P}_{\text{Adam } m,\,v} \;\approx\; 14P \text{ bytes}
+$$
+
+for $P$ parameters. This is the *checkpoint-persisted* state — gradients are
+transient and excluded by design, which is why the constant is $14$ rather than
+the familiar $16$ bytes/param, and it assumes fp32 Adam moments (bf16 master
+weights or 8-bit optimizer states would shift the constant). A model with tens
+of billions of parameters lands around a terabyte *per checkpoint* — hundreds of
+billions puts you in the multi-terabyte range.
+Now suppose you do the obvious thing:
+at step $k$, every rank stops, serializes its state, and writes it to object
+storage before anyone takes step $k{+}1$. The wall-clock cost of that barrier is
+
+$$
+T_{\text{stall}} \;\approx\; \frac{S}{B_{\text{remote}}}
+$$
+
+where $B_{\text{remote}}$ is your effective throughput to the object store.
+Remote storage is bandwidth-limited and latency-prone compared to local disk, so
+this term is large — often tens of seconds to minutes — and during all of it
+*every accelerator in the job is idle*. That is a pure bubble, and it scales with
+how often you checkpoint. The tension is brutal: failures push you to checkpoint
+*more* often (to lose less work per crash), but a synchronous write makes each
+checkpoint *more* expensive. You end up checkpointing rarely, which means each
+crash costs you a lot of recomputation.
+
+The fix is to attack the problem on two fronts at once: make each rank write
+*less* (sharding), and get the slow remote write *off* the critical path
+(staging plus async upload).
+
+## Shard the checkpoint across ranks
+
+In a 3D-parallel job, the model state is already partitioned across the mesh —
+data-parallel replicas, tensor-parallel shards, pipeline stages. The mistake is
+to *gather* it all back to rank 0 and write one monolithic file. That serializes
+the whole job through a single writer and a single network link.
+
+Instead, **each rank writes the slice of state it already owns**, in parallel.
+With a ZeRO-style distributed optimizer the optimizer state is sharded across the
+data-parallel group; tensor and pipeline parallelism shard the weights. So the
+aggregate write throughput becomes the *sum* of the ranks' individual links
+rather than one rank's link:
+
+$$
+T_{\text{write}} \;\approx\; \frac{S}{\sum_r B_r} \;=\; \frac{S / N}{\bar{B}}
+$$
+
+for $N$ writers. This sum-of-links speedup holds only until the aggregate hits
+the backend ceiling — $\sum_r B_r \le B_{\text{backend}}$, where the object store
+or the cross-rank network and NIC egress saturate well before $N\,\bar{B}$. So
+sharding parallelizes the staging, serialization, and upload fan-out, but it does
+not buy you more total egress bandwidth than the backend has; past that point the
+remote write is bound by $B_{\text{backend}}$, which is exactly why you want it
+off the critical path. Each rank emits its own shard plus a small metadata record
+describing what global tensor ranges that shard covers. A separate index file
+ties the shards back together into a logical checkpoint. This is exactly the
+model behind PyTorch Distributed Checkpoint (DCP): the on-disk layout is a set of
+per-rank shard files plus a `.metadata` index, and — crucially — it's
+*resharding-aware*. You can save on one parallelism layout and load on a
+different one, because the index describes global tensor coordinates, not
+"whatever rank 3 happened to hold last time."
+
+## Stage local, upload async
+
+Sharding shrinks each write but the bytes still have to reach the object store
+eventually, and that path is slow. So split the checkpoint into phases on
+different timelines:
+
+1. **Snapshot to host memory (fast, on the critical path).** The only thing the
+   training loop must block on is the GPU→host copy into pinned memory — a D2H
+   memcpy that snapshots the tensors so training can mutate them again. With each
+   rank snapshotting its own resident shard, that copy is essentially the entire
+   critical-path cost.
+2. **Spill and upload (slow, off the critical path).** Once the snapshot is in
+   host memory, a background worker serializes it, spills it to local NVMe, and
+   streams the staged shards to S3 *while training continues*. The GPUs are
+   already back to computing step $k{+}1$, and neither the host→NVMe spill nor the
+   NVMe→S3 upload sits on the loop's critical path.
+
+The overlap is the whole game. If the upload of checkpoint $k$ finishes before
+you want to take checkpoint $k{+}1$, the slow remote write is effectively free —
+it hides entirely under compute, the same way prefetching hides IO under a
+training step.
+
+```python
+# illustrative — not a real implementation
+def checkpoint(step, model, optimizer, rng, dataloader):
+    # Phase 1: on the critical path, but fast — GPU -> pinned host memory (D2H copy).
+    shard = {
+        "model": model.local_shard_state(),        # this rank's slice only
+        "optim": optimizer.local_shard_state(),     # ZeRO-sharded m, v, master
+        "rng": rng.get_state(),                     # see below — load-bearing
+        "step": step,
+        "data_cursor": dataloader.cursor(),
+    }
+    snapshot = copy_to_pinned_host(shard)                # blocks briefly: D2H only
+
+    # Phase 2: hand off to the background worker and RETURN immediately.
+    #          serialize + spill to NVMe + upload all run off the critical path.
+    uploader.submit(snapshot, remote=f"s3://ckpts/step-{step}/shard-{RANK}")
+    # training loop resumes here; spill and upload run concurrently
+```
+
+There is one correctness rule the background uploader must obey: a checkpoint is
+not "done" until **every** rank's shard plus the index has fully landed in object
+storage. Publish completeness with a single marker: write all shards and the
+index first, and only then write a small `_COMPLETE` object. That last-written
+marker is the reliable primitive because object stores have no atomic
+multi-object rename — a prefix "move" is really a non-atomic copy-then-delete, so
+you can't lean on a rename to flip a whole checkpoint live the way you would on a
+POSIX filesystem. (Modern S3 is strongly read-after-write consistent, so a
+read of the marker after it lands is safe; the missing primitive is atomicity
+across many objects, not consistency.) A half-uploaded checkpoint must never look
+loadable, or your reliability guardrail becomes a way to silently load corrupt
+state.
+
+## What you must save for a *correct* resume
+
+It is tempting to think a checkpoint is just weights. It isn't. A checkpoint that
+restores weights but nothing else will resume *running* but won't resume *the
+same run*. For a deterministic continuation you need all four of:
+
+- **Model weights** — obvious, the parameters $\theta$.
+- **Distributed optimizer state** — the fp32 master copy plus Adam's first and
+  second moments $m, v$. Drop these and you restart the optimizer cold: momentum
+  and the second-moment denominator reset to zero, the effective learning rate
+  spikes, and you get a visible loss bump or divergence right after every resume.
+- **RNG state** — the PRNG seeds/offsets for every rank, plus CUDA generators.
+  This is the one people forget. Dropout masks, any stochastic data
+  augmentation, sampling in RL rollouts — all of it is driven by the RNG. Resume
+  with a fresh RNG and the post-resume trajectory diverges from what an
+  uninterrupted run would have produced. Reproducibility — the thing
+  that lets you debug "did my code change anything, or was it just noise?" — is
+  gone, at least up to the determinism of the kernels and collectives you've
+  pinned.
+- **Dataloader / step position** — which step you're on and where the input
+  pipeline's cursor sits. Miss this and you either replay batches you already
+  trained on (over-weighting that data) or skip batches entirely. Either way the
+  data distribution the model sees no longer matches the intended schedule.
+
+The mental model: a training run is a deterministic function of (initial state,
+RNG stream, data order). A correct checkpoint captures *all three* mid-stream so
+the function can be resumed from the middle instead of restarted from the top.
+
+$$
+\theta_{k+1} \;=\; f\big(\theta_k,\; m_k,\; v_k,\; \text{RNG}_k,\; \text{batch}_k\big)
+$$
+
+If any argument on the right is missing or reset, $\theta_{k+1}$ after a resume
+is not the $\theta_{k+1}$ the run would have produced. Bit-for-bit equality is a
+stronger claim still: it also requires deterministic kernels and a fixed
+reduction and rank order, since non-deterministic CUDA atomics, cuDNN
+autotuning, flash-attention's varying reduction order, and a changed collective
+order under a different layout all break it. (Toggling a precision mode like
+TF32 doesn't add run-to-run nondeterminism — it's deterministic at a fixed
+reduction order — but it does break bitwise equality against an fp32 baseline.) Resharding onto a new
+layout, useful as it is, can itself change reduction order — so treat
+"reproducible" as "reproducible up to the determinism you've pinned," not an
+unconditional guarantee.
+
+## Automated resume as a guardrail
+
+The point of all this is unattended survival. When a job restarts — for any
+reason — it should recover by itself, and it should refuse to recover from
+anything questionable:
+
+```python
+# illustrative — not a real implementation
+def recover():
+    candidates = list_checkpoints("s3://ckpts/")        # newest first
+    for ckpt in candidates:
+        if not has_complete_marker(ckpt):               # half-uploaded? skip
+            continue
+        if not index_matches_shards(ckpt):              # missing a shard? skip
+            continue
+        return load_distributed(ckpt)                   # validated; resume here
+    return cold_start()                                 # nothing valid -> step 0
+```
+
+Two ideas do the heavy lifting. First, **detect the last *complete* checkpoint**,
+not the last *attempted* one — if a crash happened mid-upload, the newest prefix
+on disk is garbage and must be skipped. Second, **validate completeness before
+loading**: confirm the index is present and every shard it references exists with
+the expected size. Loading a checkpoint that's missing one tensor-parallel shard
+doesn't fail loudly; it fails subtly, with a slice of the model silently wrong.
+The `_COMPLETE` marker plus an index-versus-shards check turns "newest directory"
+into "newest *trustworthy* state."
+
+## So what
+
+Checkpointing at scale is a reliability system, not a save button. The pieces
+compose into a simple contract:
+
+- **Shard** so the write is parallel and $O(S/N)$ per rank, not $O(S)$ through
+  rank 0 — and so you can reshard on load.
+- **Stage to host memory, then spill and upload to object storage asynchronously**, so the
+  slow remote write overlaps compute and the GPUs barely notice a checkpoint
+  happened.
+- **Save weights, distributed optimizer state, RNG, and data position** — all
+  four — so resume is deterministic and not just "still running."
+- **Automate recovery with completeness checks**, so the last *valid* checkpoint
+  is found and loaded without a human in the loop.
+
+Get this right and the failure weather in that opening animation stops being
+catastrophic. An OOM, an NCCL timeout, a reclaimed node — each one costs you the
+minutes since the last complete checkpoint, not the run. The crashes still
+happen as often as ever; they just stop mattering.

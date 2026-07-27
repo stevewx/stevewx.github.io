@@ -1,0 +1,48 @@
+---
+import { SOCIALS } from "../consts";
+import { getLocaleFromPath } from "../i18n/config";
+import { t } from "../i18n/ui";
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+const strings = t(locale);
+const year = 2026; // build-time constant; bump as needed
+const socials = SOCIALS.filter((s) => s.show);
+
+// Localized social labels keyed by the stable English label in consts.
+const socialLabel: Record<string, string> = {
+  GitHub: strings.socials.github,
+  LinkedIn: strings.socials.linkedin,
+};
+---
+
+<footer class="mt-16 border-t border-ink-800/80">
+  <div
+    class="mx-auto flex max-w-5xl flex-col gap-4 px-5 py-10 sm:flex-row sm:items-center sm:justify-between"
+  >
+    <p class="font-mono text-xs text-slate-500">
+      © {year} {strings.site.name} · {strings.footer.builtWith}{" "}
+      <a
+        href="https://astro.build"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-slate-400 hover:text-accent">Astro</a
+      >
+    </p>
+    <ul class="flex flex-wrap gap-4">
+      {
+        socials.map((s) => (
+          <li>
+            <a
+              href={s.href}
+              class="font-mono text-xs text-slate-400 hover:text-accent"
+              target={s.href.startsWith("http") ? "_blank" : undefined}
+              rel={s.href.startsWith("http") ? "noopener noreferrer" : undefined}
+            >
+              {socialLabel[s.label] ?? s.label}
+            </a>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</footer>

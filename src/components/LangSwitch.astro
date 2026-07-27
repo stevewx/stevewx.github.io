@@ -1,0 +1,57 @@
+---
+/**
+ * Language switch. Renders EN / 中文 pills that link to the SAME page in the
+ * other locale. The counterpart path is computed from the current URL; callers
+ * may pass an explicit `hrefFor` map when the naive path swap is wrong (e.g. a
+ * blog post whose translation is missing — then we point at the blog index).
+ */
+import {
+  LOCALES,
+  LOCALE_LABELS,
+  getLocaleFromPath,
+  switchLocalePath,
+  type Locale,
+} from "../i18n/config";
+
+interface Props {
+  /** Optional per-locale override paths (used by blog posts). */
+  hrefFor?: Partial<Record<Locale, string>>;
+  class?: string;
+}
+const { hrefFor, class: className } = Astro.props;
+
+const current = getLocaleFromPath(Astro.url.pathname);
+
+const links = LOCALES.map((loc) => ({
+  loc,
+  label: LOCALE_LABELS[loc],
+  href: hrefFor?.[loc] ?? switchLocalePath(Astro.url.pathname, loc),
+  active: loc === current,
+}));
+---
+
+<div
+  class:list={["flex items-center gap-0.5 font-mono text-xs", className]}
+  aria-label={current === "zh" ? "切换语言" : "Switch language"}
+>
+  {
+    links.map((l, i) => (
+      <>
+        {i > 0 && <span class="text-slate-600">/</span>}
+        <a
+          href={l.href}
+          hreflang={l.loc === "zh" ? "zh-Hans" : "en"}
+          aria-current={l.active ? "true" : undefined}
+          class:list={[
+            "rounded px-1.5 py-1 transition-colors",
+            l.active
+              ? "text-accent"
+              : "text-slate-400 hover:text-slate-100",
+          ]}
+        >
+          {l.label}
+        </a>
+      </>
+    ))
+  }
+</div>

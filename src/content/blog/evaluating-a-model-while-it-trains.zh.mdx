@@ -1,0 +1,125 @@
+---
+title: "边训练边评估模型"
+description: "为什么大模型 RL 训练里没法把评估内联进训练循环，以及 sidecar 模式如何在不拖慢训练的前提下，给出逐 checkpoint 的连续质量曲线。"
+date: 2024-02-12
+category: work
+author: Xuan Wang
+tags: ["eval-automation","checkpointing","rlhf","ppo","mlops"]
+featured: false
+draft: false
+lang: "zh"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+你在一个已经占满大半 GPU 显存的 policy 模型上，启动了一次要跑好几天的 PPO run。跑了一天，有人问出那个再自然不过的问题：模型真的在变好吗？reward 曲线当然有，可训练分布上的 reward，和你真正在意的那些 benchmark 上的质量，根本不是一回事。于是你想到那个看似顺理成章的办法：往训练循环里插一个 eval 调用，每隔几百步跑一次，把数字记下来。
+
+这个办法多半会出事。第一次 eval 跑起来，要么把训练器直接顶进显存溢出崩溃，要么在 eval 期间把每个 worker 都卡住，让一个本就昂贵的同步作业变成一间同样昂贵的候诊室。生产里很快就会得到一个教训：大型 RL checkpoint 的评估，应该挪到训练关键路径**之外**，交给一个独立进程去做——由它盯着新 checkpoint 出现，再自己安排后续。这个独立进程，就是 sidecar。
+
+<SceneFigure scene="sidecar" height={160} caption="训练器写出 checkpoint；一个解耦的 sidecar 把它们取走，负责转换格式、起服务、评估、记日志——全程不阻塞训练循环。" />
+
+## 内联 eval 为什么行不通
+
+两个问题，而且会互相叠加放大。
+
+**显存争用。** RLHF 的 PPO 配置本来就在设备上压着一大堆状态——经典的四模型齐上阵，再加上训练顺带拖着的一切：policy 权重（$M_{\text{policy}}$）、算 KL 惩罚用的 reference 模型（$M_{\text{ref}}$，一般和 policy 同尺寸）、一个 value/critic 模型（$M_{\text{critic}}$——常常是独立的一张网络，有时是共享 backbone 上的一个 head）、一个给 rollout 打分的 reward 模型（$M_{\text{rm}}$，通常和 critic 差不多大，在这个时代的配置里一般跟它共置）、优化器状态（$M_{\text{optim}}$：混合精度下的 Adam 大约每个参数 12 字节——两份 fp32 动量缓冲加一份 fp32 主副本——摞在工作用的 bf16/fp16 参数之上，两个可训练模型都得背着它）、梯度（$M_{\text{grad}}$），还有激活值（$M_{\text{act}}$：前向传播时为反向传播存下的中间张量——大小随 batch × 序列长度 × 隐藏维度 × 层数增长）。到了 eval 阶段，生成又要额外占一块 KV cache（$M_{\text{kv}}$），它随 batch size 和序列长度增长。如果你想在同一个进程里再立起一条推理路径，那要的峰值显存大致就长这样
+
+$$
+M_{\text{peak}} \approx M_{\text{policy}} + M_{\text{ref}} + M_{\text{critic}} + M_{\text{rm}} + M_{\text{optim}} + M_{\text{grad}} + M_{\text{act}} + M_{\text{kv}}
+$$
+
+那些训练部件按设计本来就贴着设备上限——你定这次 run 的规模，就是奔着把硬件榨干去的。再给一个 decode 很重的 benchmark 摞上 $M_{\text{kv}}$，很可能就是压垮它、把它推进 OOM 的最后一根稻草。而分布式训练器里的 OOM 很少能干净地重试；它往往会拖垮某个 rank，要是没有弹性重启，还能把整个作业一并带走。
+
+**循环停摆。** 就算你想办法把它塞下了，生成本身也很慢，一个序列内部是逐 token 顺序出的（虽然多个序列可以并行 decode）。一套假设要花十分钟才 decode 完的 benchmark，就意味着优化器有十分钟什么都没干。在同步的 data-parallel 作业里，最慢的 rank 会拖住所有人，所以哪怕只在单个 rank 上做 eval，其余 rank 照样得空转。你等于是为一个单进程的活儿付了整个集群的钱。在一次跑好几天、又频繁 eval 的 run 里，这份开销可不是舍入误差——它在 wall-clock 和预算里都占了实打实的一块。
+
+其实想清楚很简单：训练要的是吞吐量和平稳的显存压力，eval 要的是能容忍延迟、来一阵是一阵的突发式生成。这是两种资源画像完全不同的工作负载。硬塞进同一个进程，结果就是两边互相拖后腿。
+
+## sidecar：以 checkpoint 为界解耦
+
+训练器的职责就是训练，顺带产出 checkpoint。这是它唯一的契约。所有跟评估沾边的事，都放进一个伴生进程——也就是 sidecar——它存在的全部意义，就是把"出现了一个新 checkpoint"这件事，变成"实验追踪器里多出一行指标"。
+
+交接点就是共享存储上的 checkpoint。训练器负责写，sidecar 负责盯。两者从不共用 GPU，从不共用一个 Python 进程，也从不互相阻塞。sidecar 哪怕落后了、挂了，或者你在 run 中途把它重新部署一遍，训练器都察觉不到。这正是关键所在——对训练器来说，eval 出问题必须是件无关紧要的事。
+
+```python
+# illustrative — not a real implementation
+def watch_and_evaluate(ckpt_dir, tracker):
+    seen = set()
+    while training_is_live(ckpt_dir):
+        for ckpt in sorted(new_checkpoints(ckpt_dir)):
+            if ckpt in seen:
+                continue
+            seen.add(ckpt)
+            try:
+                hf_model = convert_to_inference_format(ckpt)
+                server = serve(hf_model)              # own GPUs, own process
+                metrics = run_benchmark_suite(server)
+                tracker.log(step=step_of(ckpt), metrics=metrics)
+            except Exception as err:
+                tracker.log_warning(ckpt, err)        # never crash the watcher
+        sleep(POLL_INTERVAL)
+```
+
+注意那圈把整个逐 checkpoint 主体裹起来的 `try`/`except`。一个格式坏掉的 checkpoint、一次不稳的服务启动、一次 benchmark 超时——这些都不该弄死 watcher。记一笔，接着往下走，下一个 checkpoint 重新来过就是了。
+
+## 第一步：转换 checkpoint 格式
+
+这一步最容易被低估。训练器写出来的格式，并不是推理服务器读得进去的格式。
+
+分布式 RL 训练器会把参数按 rank 做 sharding，并以这种 sharded 布局存盘，中间还夹杂着优化器状态、value 模型、RNG 状态和步数计数器。这跟推理引擎想要的东西——一个整理好的 Hugging Face 风格目录，含 `config.json`、一个 tokenizer 和一个 `model.safetensors`（或带索引的 sharded `safetensors`）——差多远，完全看训练后端是哪一种：
+
+- **用 FSDP 或 DeepSpeed-ZeRO 包一个原生 HF 模型**，属于简单情形。参数还是原来的 HF 名字；框架只是把它们展平、做了 sharding。一次 full-state-dict 保存会把 shard 收拢回来、剥掉 wrapper 前缀、扔掉优化器状态，之后你手里基本就是个 HF checkpoint——*布局和名字都不用动*。
+- **Megatron 系的训练器**（Megatron-LM 和 NeMo——大规模训练的常见选择）则是困难情形，这一步之所以名声在外，原因就在这儿。磁盘上的模型是真的*不是* HF：有 tensor-parallel shard 要合、有 pipeline stage 要拼、有一份**按 head 交织存放的 fused QKV**、有 fused 的 gate/up MLP 投影、有 vocab-parallel embedding，还有一堆 Megatron 特有的参数名。这是一次货真价实、又容易踩坑的 Megatron→HF 转换，绝不是改个名字那么简单。
+
+所以在 Megatron 的情形下，转换这一步得做到：
+
+- 把 tensor/pipeline-parallel 的 shard 收拢、合并回完整的参数张量，
+- 扔掉推理用不上的一切（优化器状态、value/critic 模型——那个冻结的 reference 模型压根就没进过 checkpoint，因为它是直接从基座权重重新加载的），
+- 把 QKV 和 MLP 投影拆开、反交织，并把 Megatron 的参数名重映射成 HF 架构认的那套名字，
+- 再写出 config 和 tokenizer，好让服务器能单独把它加载起来。
+
+```python
+# illustrative — not a real implementation
+def convert_to_inference_format(ckpt):
+    shards = load_sharded(ckpt)                 # per-rank tensors
+    full = gather_full_params(shards)           # un-shard to whole tensors
+    weights = {
+        remap_name(k): v
+        for k, v in full.items()
+        if is_policy_param(k)                   # skip critic / optim state
+    }
+    write_safetensors(weights, ckpt.hf_path)
+    write_config_and_tokenizer(ckpt.hf_path)
+    return ckpt.hf_path
+```
+
+这里有两点要紧。第一，张量处理必须分毫不差。单纯的名字对不上，通常会大声报错——加载时冒出缺失的或多出来的 key——所以真正危险的是那种*无声*的情况：名字对了，布局却错了（权重被转置、QKV 顺序被调换、dtype 不对），它能干干净净地加载，评估出来却是一堆噪声，这比不做 eval 还糟，因为它看着煞有介事。要用两道关卡兜住：一道严格的 key 断言，再加一次廉价的数值合理性检查——比如确认转换后的模型在一个固定 batch 上的 logits，跟训练器算出来的对得上。第二，这个收拢过程本身就可能很吃显存，这也是它放在 sidecar 而不是训练器里跑的又一个理由：你同样不希望 un-sharding 去和正在训练的显存抢地盘。
+
+## 第二步：分层评估
+
+不是每个 checkpoint 都值得跑完整套件，也不是每个信号都得等它跑完。按成本和延迟，把 eval 分成几层。
+
+**冒烟层——快、频繁、几乎等同内联。** 一个极小的固定 prompt 集合（量级是几十，不是几千）、greedy decode、很短的 max-new-tokens。它只回答一个问题：这个 checkpoint 有没有灾难性地退化——退化式重复、格式崩坏、大面积拒答崩塌？（这么个小的 greedy 集合，在这儿只能抓到一眼可见的崩坏；拒答*率*的漂移对 prompt 和采样都很敏感，那种就留给完整层。）它便宜到几乎每个 checkpoint 都能跑，给你拉一根提前预警的绊线。这一层用一小块借来的算力就能跑，不必把那台重量级服务器立起来。
+
+**完整层——昂贵、批量化、离线。** 真正的 benchmark 套件：留出的 preference 集、能力 benchmark、安全探针（含拒答率追踪）、更长的生成，也许还带上多个 seed 的采样 decode。到这一层，你才会把那台像样的推理服务器立起来，往里灌大 batch。它按自己的节奏跑——每第 N 个 checkpoint 一次，或者每当冒烟层看着还健康时就跑——落后训练器一两个 checkpoint 也没人会在意。
+
+这两层正好对上前面 OOM 和停摆那两个问题。冒烟层足够便宜，占用小、跑得快，谁也威胁不到。完整层才是那个内联跑就会炸的家伙，所以干脆让它彻底离线、彻底批量化，住在独立资源上——反正没人等它，延迟无所谓。
+
+## 第三步：逐 checkpoint 的连续曲线
+
+因为每个 checkpoint 都走同一条流水线，最后都落进同一个以训练步为键的追踪器，你就拿到了内联 eval 从来没法干净地给出的东西：一条和你的 reward、KL 曲线共享同一时间轴的连续质量曲线。
+
+价值恰恰就在这份对齐上。你可以把 benchmark 准确率和 KL-to-reference 惩罚叠在一起看，一眼就能看到过度优化的那个拐点——reward 还在往上爬、真实质量却已经走平甚至掉头向下的那一刻，原因就是 policy 开始钻 reward 模型的空子了。具体点说，如果你在第 $t$ 步追踪质量 $Q(t)$，对照
+
+$$
+\text{reward}(t) - \beta \, \mathrm{KL}\!\left(\pi_t \,\|\, \pi_{\text{ref}}\right)
+$$
+
+你就能挑出那个让留出质量最高的 checkpoint，而不是让训练 reward 最高的那个——而这两者常常并不是同一个 checkpoint。挑对哪一个，是一道只有在你把每个候选都量过之后才做得出来的选择题，而这恰恰就是 sidecar 帮你换来的。
+
+这个追踪器（MLflow 那一路：实验、run、逐步指标、artifact）就成了唯一可信的数据源。每一行是一个 checkpoint，每一列是一个 benchmark，步轴和训练严丝合缝对齐。run 之间的对比、回归检测，还有最终 checkpoint 的选择，统统从这里读。
+
+## 说到底
+
+想内联做评估，这个直觉合情合理，可一旦规模上去就是错的。大模型 RL 训练器早就按硬件把规模顶满了，而评估是另一种工作负载——带着自己一套显存和延迟画像的突发式生成——它和同步优化没法共处一室。硬把两者凑一块，换来的就是 OOM 崩溃和停摆的集群。
+
+sidecar 模式的解法，是让 checkpoint 成为两者之间唯一的契约。训练器只管训练、只管写出；一个解耦的 watcher 把每个 checkpoint 从 sharded 训练格式转成独立的推理格式，起服务，跑一套分层的 benchmark 套件，记录逐 checkpoint 的指标——全程都在关键路径之外。eval 出问题，从此无关紧要。而回报，是一条连续的、和训练步对齐的质量曲线，让你能凭真实质量而不是训练 reward 去挑 checkpoint。这份解耦不是锦上添花；正是它，才让这项测量从根本上成为可能。

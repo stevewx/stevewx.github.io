@@ -1,0 +1,129 @@
+---
+title: "为什么需要 GQA：KV cache 的显存账与头数不对等问题"
+description: "在长上下文、大 batch 下真正撑爆显存的是 KV cache，不是参数量。Grouped-Query Attention 用一个干净的倍数把它缩小——可一旦动手实现，融合的 QKV 投影和 attention kernel 都得学会同一件事：Q 的头数比 K、V 多。"
+date: 2024-04-15
+category: work
+author: Xuan Wang
+tags: ["gqa", "mqa", "kv-cache", "attention", "inference"]
+featured: false
+draft: false
+lang: "zh"
+references:
+  - authors: "Ainslie et al., 2023"
+    title: "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"
+    url: "https://arxiv.org/abs/2305.13245"
+    note: "提出 GQA，以及从 MHA 继续训练（uptraining）的做法"
+  - authors: "Shazeer, 2019"
+    title: "Fast Transformer Decoding: One Write-Head is All You Need"
+    url: "https://arxiv.org/abs/1911.02150"
+    note: "最早提出 Multi-Query Attention"
+  - authors: "Dao, 2023"
+    title: "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning"
+    url: "https://arxiv.org/abs/2307.08691"
+    note: "融合的、IO-aware 的 attention；对共享的 K/V 头（MQA/GQA）用索引而不是复制"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+训练模型的时候，大家的注意力都盯在参数量上。可真到了长上下文、batch size 又开得比较大的场景下去*服务*这个模型，悄悄吃光 HBM 的却是另一个数——**KV cache**。它会跟着序列长度和 batch 一起涨，而权重从来不会；在长上下文的 decode 负载里，它甚至能把模型本身远远盖过去。GQA（Grouped-Query Attention）就是业界的标准答案——同时也是个很好的例子，说明"共享 K/V 头"这么一句话的想法，是怎么一路波及到融合的投影布局和 attention kernel 的。
+
+<SceneFigure
+  scene="gqa-heads"
+  height={160}
+  caption="Multi-Head、Grouped-Query、Multi-Query 三种 attention。每个 query 头都得配一个 key/value 头来 attend：MHA 是 1:1 配对；GQA 让一组 query 头共用一个 K/V 头；MQA 则让所有 query 头共用同一个 K/V 头。K/V 头越少，cache 越小。"
+/>
+
+## KV cache 究竟是什么
+
+自回归 decode 时，每生成一个新 token，都要 attend 到前面所有 token。而前面这些 token 的 key 和 value 是不变的，所以算一次存下来就行。这份存下来的张量——按层、按 attention 头、覆盖当前整条序列——就是 KV cache。说白了它就是个吞吐优化：要是没有它，每生成一个新 token 都得把整个前缀重新前向一遍，而这一遍里的 self-attention 每步是 $O(n^2)$。有了 cache，每步就降到 $O(n)$——新 token 只算自己的 query，再去 attend 那 $n$ 个存好的 key 和 value。把 $n$ 个 token 整段生成算下来，这就是总量 $O(n^3)$ 和 $O(n^2)$ 的差别。
+
+代价在显存上。把整个 batch 算进去，cache 的大小是：
+
+$$
+\text{bytes} \;=\; 2 \cdot L \cdot H_{kv} \cdot d_{\text{head}} \cdot S \cdot B \cdot b_{\text{dtype}}
+$$
+
+其中 $L$ 是层数，$H_{kv}$ 是 **key/value** 头的个数，$d_{\text{head}}$ 是每个头的维度，$S$ 是序列长度，$B$ 是 batch size，$b_{\text{dtype}}$ 是每个元素占的字节数（fp16/bf16 是 2）。最前面那个 $2$ 最容易被漏掉：K 和 V 是**两份都要存**的。
+
+代入一组真实数字。32 层、32 个头、$d_{\text{head}}=128$、fp16，8K 上下文、batch 16：
+
+$$
+2 \cdot 32 \cdot 32 \cdot 128 \cdot 8192 \cdot 16 \cdot 2 \;\approx\; 68.7\ \text{GB}
+$$
+
+这还*只是 cache*——权重、激活值都没算进去。这里用的是十进制吉字节（$10^9$ 字节），换算过来正好是 64 GiB；一块 80 GB 级别的卡（A100/H100）实际能用的大约是 80 GiB，也就是说光 cache 就占掉差不多 80%，留给权重和激活值的空间所剩无几。再看它随什么涨：对 $S$ 和 $B$ 都是线性的。上下文翻倍，cache 翻倍；batch 翻倍，cache 也翻倍。而权重呢，不管你服务的序列有多长、有多少条，大小都是固定的。这就是为什么到了服务阶段，卡住 batch size 和最大上下文的，通常是 KV cache，而不是参数量。
+
+## 真正能下手的地方：K/V 头太多了
+
+回头看那条公式。$L$、$S$、$B$ 由模型和负载定死了，$d_{\text{head}}$ 也是写进架构里的。不用重训一张形状不同的网络就能动的，只剩 $H_{kv}$ 这一项——也就是 *key/value* 头的个数。
+
+标准的 **Multi-Head Attention（MHA）** 里，每个 query 头都配一个自己专用的 K/V 头，所以 $H_{kv} = H_q = H$。这就是动画最左边那一组：干干净净的 1:1 配对。它也是开销最大的一端——cache 得为全部 $H$ 个头各存一整套 K 和 V。
+
+整个变体家族背后的观察是这样的：推理时，K、V 投影对头的多样性远没有 Q 那么敏感。你可以放开手去共享它们，损失却小得出乎意料。
+
+**Multi-Query Attention（MQA）** 把这条路走到了头（Shazeer, 2019）：所有 query 头共用*一个* K/V 头。于是 $H_{kv} = 1$，cache 直接缩小 $H$ 倍。放到前面那个例子里，就是从 68.7 GB 降到约 2.1 GB——收益巨大。代价是质量：把所有 key/value 信息压进一个头，等于砍掉了表达能力，GQA 论文和后续工作都报告过 MQA 会掉点，某些配置下训练还会不稳。
+
+**Grouped-Query Attention（GQA）** 走的是折中路线（Ainslie et al., 2023）：把 $H$ 个 query 头分成 $G$ 组，每组共享一个 K/V 头。于是 $H_{kv} = G$，其中 $1 \le G \le H$：
+
+$$
+G = H \;\Rightarrow\; \text{MHA}, \qquad G = 1 \;\Rightarrow\; \text{MQA}
+$$
+
+cache 缩小的倍数是 $H / G$。$H = 32$ 时取 $G = 8$，cache 就降到四分之一——贯穿全文的这个例子从 68.7 GB 降到约 17 GB——而质量和完整 MHA 相比还落在噪声范围内。这正是当下大多数开源模型出厂时选的甜点区：K/V 的多样性够用，能保住质量；K/V 头又足够少，让长上下文服务变得可行。动画中间那一组画的就是这个：几个 query 头汇到同一个共享的 K/V 头上。
+
+论文里还有个很实用的点：GQA 模型不必从头预训练。你可以从现成的 MHA checkpoint 出发做 **uptraining**——在每组内部对 K、V 投影权重做均值池化，用它来初始化共享头，再拿原始算力的一个零头做微调就行。分组后的模型花很小的代价，就能把质量几乎全数找回来。
+
+## 工程上的坑：Q、K、V 宽度不再一致
+
+"共享 K/V 头就完事了"这个想法，到这里就不再只是一行数学，开始碰到真实代码了。MHA 里三个投影是对称的：Q、K、V 各产出 $H \cdot d_{\text{head}}$ 个特征。正是这份对称，让各种实现都偏爱 **融合的 QKV 投影**——一个大 matmul 一次吐出三者，再干净利落地 reshape 成三个等大的 `[H, d_head]` 块。
+
+GQA 把这份对称打破了。Q 还是 $H$ 个头，K 和 V 却只剩 $G$ 个。融合权重不再是三块等大的板：
+
+$$
+W_{qkv} \in \mathbb{R}^{\,d_{\text{model}} \;\times\; (\,H + 2G\,)\,d_{\text{head}}}
+$$
+
+这个 matmul 的输出得**按不等宽**切开：前 $H \cdot d_{\text{head}}$ 列是 Q，接着 $G \cdot d_{\text{head}}$ 列是 K，最后 $G \cdot d_{\text{head}}$ 列是 V。凡是默认三等分的代码——权重加载、tensor-parallel 的 sharding、投影之后的 reshape——都得重新教会它这个新布局。这也是 GQA 集成最容易翻车的地方：一个还按三等分去切融合权重的 checkpoint 转换器，或者一次这样切的 TP 拆分，会不声不响地把各个头搅乱。
+
+```python
+# illustrative — not a real implementation
+# fused QKV with GQA: Q has H heads, K and V have G heads each
+qkv = x @ W_qkv                       # [B, S, (H + 2G) * d_head]
+q, k, v = qkv.split(
+    [H * d_head, G * d_head, G * d_head], dim=-1
+)
+q = q.view(B, S, H, d_head)           # H query heads
+k = k.view(B, S, G, d_head)           # G key heads
+v = v.view(B, S, G, d_head)           # G value heads
+```
+
+上了 tensor parallelism 就更讲究了。有 $N$ 个 TP rank 时，你希望每个 rank 既拿到 $H/N$ 个 query 头，又拿到与之匹配的 $G/N$ 个 K/V 头，这样一个组就不会横跨两块设备。要干净地切，就得 $G$ 能被 $N$ 整除；一旦 $N > G$，实现只能改成在各 rank 之间复制 K/V 头。这个约束 MHA 根本没有，却悄悄圈定了哪些并行配置是合法的。
+
+## 轮到 attention kernel：复制还是索引
+
+集成的后半段是 attention 计算本身。每个 query 头都得找一个 K/V 头来 attend。MHA 里这配对再简单不过：头 $i$ 用 K/V 头 $i$。到了 GQA，query 头 $i$ 得用 K/V 头 $\lfloor i / (H/G) \rfloor$——也就是它所在组共享的那个头。这下好几个 query 头都指向了**同一份** K 和 V。
+
+想让现成 kernel 直接跑起来，最省事的做法是把每个 K/V 头物理复制 $H/G$ 份，让张量重新凑齐 $H$ 个头，然后照普通 MHA 跑。这样做结果没错，`repeat_kv` 这类辅助函数干的就是这事——可它在计算时又把全尺寸的 K 和 V 重新物化了出来，等于把省下的显存原样吐了回去。
+
+```python
+# illustrative — not a real implementation
+def repeat_kv(x, n_rep):                  # x: [B, S, G, d_head]
+    B, S, G, d = x.shape
+    if n_rep == 1:
+        return x
+    return (x[:, :, :, None, :]            # [B, S, G, 1, d]
+              .expand(B, S, G, n_rep, d)   # broadcast across the group
+              .reshape(B, S, G * n_rep, d))  # back to H heads
+```
+
+真正的融合 kernel 做得更聪明。FlashAttention 和各家服务引擎不复制，而是**索引**：每个 query 头直接从那份小 cache 里读出它所在组唯一的 K/V 头，于是显存里 cache 一直保持 $G$ 个头，组结构不过是 kernel 内部的一张索引表。这才是对的心智模型——GQA 省下来的显存要想是真的，你的 attention 路径就得*就地读*共享头，而不是把它展开回去。集成写对但慢，靠的是复制；写得好，靠的是索引。
+
+## 所以呢
+
+GQA 是个极小的架构改动，回报却大得不成比例；而它之所以重要，完全是为了服务，跟训练精度无关：
+
+- KV cache 按 $2 \cdot L \cdot H_{kv} \cdot d_{\text{head}} \cdot S \cdot B \cdot b_{\text{dtype}}$ 增长，对序列长度和 batch 都是线性——所以在长上下文下，划定显存天花板的是它，不是权重。
+- $H_{kv}$ 是唯一能缩的那一项。MHA 把它设成 $H$，MQA 设成 $1$，GQA 设成 $G$，把 cache 砍掉 $H/G$，质量还维持在接近 MHA 的水平。
+- 代价落在这些管道细节上：融合的 QKV 权重变成三块*不等宽*的板，总宽 $(H + 2G)\,d_{\text{head}}$；要干净地切 tensor-parallel，就得 $G$ 能被 TP 度整除（rank 比它多时只能复制 K/V 头）；attention kernel 则必须为每个共享的 K/V 头在组内做索引，而不是复制。
+
+只要在投影切分和 kernel 这两处都把头的账算对，你就能把一个 8K 上下文下 cache 就吃光一整块 80 GB GPU 的模型，变成能在像样的 batch size 下从容服务长序列的模型——参数一模一样，cache 只占一个零头。

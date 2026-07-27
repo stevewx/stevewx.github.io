@@ -1,0 +1,284 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /*
+   * Theme palettes as space-separated "R G B" triplets, consumed by the
+   * var-backed Tailwind color scales (see tailwind.config.mjs). The DARK values
+   * are the site's original hard-coded hex codes, verbatim — dark mode looks
+   * exactly as it did before. LIGHT is a paper-clean counterpart: the neutral
+   * ramp inverts (ink-950 = page bg, ink-600 = strongest border) and the text
+   * ramp inverts too (slate-50 = darkest heading).
+   */
+
+  /* Light theme — the default when no explicit class and OS is not dark. */
+  :root {
+    color-scheme: light;
+
+    --ink-950: 252 252 253; /* page background */
+    --ink-900: 248 250 252; /* raised surface / card */
+    --ink-850: 241 245 249;
+    --ink-800: 226 232 240; /* inline-code bg, hr */
+    --ink-700: 203 213 225; /* hairline border */
+    --ink-600: 148 163 184; /* strongest border */
+
+    --slate-50: 15 23 42; /* headings — darkest */
+    --slate-100: 30 41 59;
+    --slate-200: 51 65 85;
+    --slate-300: 51 65 85; /* body text */
+    --slate-400: 71 85 105; /* secondary text */
+    --slate-500: 100 116 139; /* muted mono labels */
+    --slate-600: 124 138 160; /* faintest */
+
+    --accent: 17 24 39; /* near-black "terminal" accent */
+    --accent-muted: 51 65 85;
+    --accent-dim: 148 163 184;
+
+    --signal: 194 65 12; /* darker orange for contrast on light */
+    --signal-dim: 154 52 18;
+
+    --glow: 148 163 184; /* subtle depth wash */
+
+    --selection-bg: rgba(17, 24, 39, 0.15);
+    --selection-fg: #0f172a;
+  }
+
+  /* Dark theme — original palette, unchanged. */
+  :root.dark {
+    color-scheme: dark;
+
+    --ink-950: 8 10 15;
+    --ink-900: 11 14 20;
+    --ink-850: 15 19 27;
+    --ink-800: 20 25 37;
+    --ink-700: 28 34 48;
+    --ink-600: 42 50 66;
+
+    --slate-50: 248 250 252;
+    --slate-100: 241 245 249;
+    --slate-200: 226 232 240;
+    --slate-300: 203 213 225;
+    --slate-400: 148 163 184;
+    --slate-500: 100 116 139;
+    --slate-600: 71 85 105;
+
+    --accent: 248 250 252;
+    --accent-muted: 203 213 225;
+    --accent-dim: 71 85 105;
+
+    --signal: 242 153 74;
+    --signal-dim: 92 58 30;
+
+    --glow: 248 250 252;
+
+    --selection-bg: rgba(248, 250, 252, 0.3);
+    --selection-fg: #ffffff;
+  }
+
+  /* No-JS fallback: honor the OS preference until an explicit choice exists. */
+  @media (prefers-color-scheme: dark) {
+    :root:not(.light):not(.dark) {
+      color-scheme: dark;
+
+      --ink-950: 8 10 15;
+      --ink-900: 11 14 20;
+      --ink-850: 15 19 27;
+      --ink-800: 20 25 37;
+      --ink-700: 28 34 48;
+      --ink-600: 42 50 66;
+
+      --slate-50: 248 250 252;
+      --slate-100: 241 245 249;
+      --slate-200: 226 232 240;
+      --slate-300: 203 213 225;
+      --slate-400: 148 163 184;
+      --slate-500: 100 116 139;
+      --slate-600: 71 85 105;
+
+      --accent: 248 250 252;
+      --accent-muted: 203 213 225;
+      --accent-dim: 71 85 105;
+
+      --signal: 242 153 74;
+      --signal-dim: 92 58 30;
+
+      --glow: 248 250 252;
+
+      --selection-bg: rgba(248, 250, 252, 0.3);
+      --selection-fg: #ffffff;
+    }
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-ink-950 text-slate-300 font-sans antialiased;
+    background-image:
+      radial-gradient(
+        60rem 60rem at 75% -10%,
+        rgb(var(--glow) / 0.05),
+        transparent 60%
+      ),
+      radial-gradient(
+        50rem 50rem at 0% 10%,
+        rgb(var(--glow) / 0.03),
+        transparent 55%
+      );
+    background-attachment: fixed;
+    /* Smooth the flip between themes without animating page load. */
+    transition:
+      background-color 0.25s ease,
+      color 0.25s ease;
+  }
+
+  ::selection {
+    background: var(--selection-bg);
+    color: var(--selection-fg);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply text-slate-100 font-semibold tracking-tight;
+    text-wrap: balance;
+  }
+
+  a {
+    @apply transition-colors;
+  }
+
+  /* Thin, technical focus ring */
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent/70 ring-offset-2 ring-offset-ink-950 rounded-sm;
+  }
+
+  code {
+    @apply font-mono text-[0.92em];
+  }
+}
+
+@layer components {
+  /* Subtle dotted grid used behind hero / section dividers */
+  .grid-dots {
+    background-image: radial-gradient(
+      rgb(var(--slate-400) / 0.12) 1px,
+      transparent 1px
+    );
+    background-size: 22px 22px;
+  }
+
+  /* Monospace "kicker" label above section headings */
+  .kicker {
+    @apply font-mono text-xs uppercase tracking-[0.2em] text-accent-muted;
+  }
+
+  /* Hairline border used across cards */
+  .hairline {
+    @apply border border-ink-700;
+  }
+
+  .card {
+    @apply hairline rounded-lg bg-ink-900/60 backdrop-blur-sm transition-colors hover:border-accent-dim;
+  }
+
+  /* Tag / category chip */
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-ink-700 bg-ink-850 px-3 py-1 font-mono text-xs text-slate-400 transition-colors;
+  }
+
+  .chip-active {
+    @apply border-accent-dim bg-accent/10 text-accent;
+  }
+
+  /*
+   * Theme-toggle icons. CSS decides which glyph shows so there is no flash and
+   * no JS needed to paint the correct icon: moon in light (→ switch to dark),
+   * sun in dark (→ switch to light). Mirrors the three theme states.
+   */
+  .icon-to-dark {
+    display: block;
+  }
+  .icon-to-light {
+    display: none;
+  }
+  :root.dark .icon-to-dark {
+    display: none;
+  }
+  :root.dark .icon-to-light {
+    display: block;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not(.light) .icon-to-dark {
+      display: none;
+    }
+    :root:not(.light) .icon-to-light {
+      display: block;
+    }
+  }
+}
+
+/*
+ * Prose (blog body) colors, driven by the theme tokens instead of Tailwind
+ * Typography's fixed light/`prose-invert` dark palettes. Because every token is
+ * a theme-aware CSS variable, mapping the --tw-prose-* variables here once makes
+ * the article text, headings, lists, quotes, and rules all flip correctly in
+ * light, dark, and auto (OS) modes — fixing the hard-to-read gray body text
+ * that `prose-invert` produced on a light background.
+ */
+.prose {
+  --tw-prose-body: rgb(var(--slate-300));
+  --tw-prose-headings: rgb(var(--slate-50));
+  --tw-prose-lead: rgb(var(--slate-400));
+  --tw-prose-links: rgb(var(--accent));
+  --tw-prose-bold: rgb(var(--slate-100));
+  --tw-prose-counters: rgb(var(--slate-500));
+  --tw-prose-bullets: rgb(var(--ink-600));
+  --tw-prose-hr: rgb(var(--ink-800));
+  --tw-prose-quotes: rgb(var(--slate-400));
+  --tw-prose-quote-borders: rgb(var(--accent-dim));
+  --tw-prose-captions: rgb(var(--slate-500));
+  --tw-prose-code: rgb(var(--accent));
+  --tw-prose-pre-code: rgb(var(--slate-300));
+  --tw-prose-pre-bg: rgb(var(--ink-900));
+  --tw-prose-th-borders: rgb(var(--ink-700));
+  --tw-prose-td-borders: rgb(var(--ink-800));
+}
+
+/*
+ * Shiki dual-theme code highlighting. With defaultColor:false each token
+ * carries --shiki-light and --shiki-dark; we activate one by the site theme.
+ * The <pre> background comes from Tailwind's prose-pre:bg-ink-900 (theme-aware),
+ * so only token color is switched here.
+ */
+.astro-code,
+.astro-code span {
+  color: var(--shiki-light);
+}
+:root.dark .astro-code,
+:root.dark .astro-code span {
+  color: var(--shiki-dark);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not(.light) .astro-code,
+  :root:not(.light) .astro-code span {
+    color: var(--shiki-dark);
+  }
+}
+
+/* Respect reduced-motion globally */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

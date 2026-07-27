@@ -1,0 +1,119 @@
+---
+title: "AnyRes and the Multimodal DPO Data Pipeline"
+description: "Why vision-language models tile high-res images into variable-length token sequences, and what that variability does to a preference-data pipeline built for DPO at scale."
+date: 2024-10-28
+category: work
+author: Xuan Wang
+tags: ["anyres", "multimodal", "dpo", "data-pipeline", "vlm"]
+featured: false
+draft: false
+references:
+  - title: "LLaVA-NeXT: Improved reasoning, OCR, and world knowledge"
+    url: "https://llava-vl.github.io/blog/2024-01-30-llava-next/"
+    note: "popularized the AnyRes tiling approach"
+  - authors: "Rafailov et al., 2023"
+    title: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+    url: "https://arxiv.org/abs/2305.18290"
+    note: "the DPO objective and its reference-policy term"
+  - title: "WebDataset"
+    url: "https://github.com/webdataset/webdataset"
+    note: "tar-shard format for high-throughput streaming dataloaders"
+---
+
+import AnyResDiagram from "../../components/AnyResDiagram.astro";
+
+Hand a typical 2024-era vision-language model (VLM) a screenshot of a spreadsheet and ask it to read the value in row 12, column C. There is a good chance it confidently makes something up. Not because the language model is dumb, but because by the time the pixels reached it, the cell was three pixels wide and the digit was gone.
+
+The culprit is the vision encoder. Most VLMs bolt a frozen CLIP/ViT encoder onto an LLM, and that encoder was trained at a fixed input size — commonly 336x336. Every image, whether it's a meme or a dense financial report, gets resized to that tiny square before encoding. For natural scenes that's fine. For OCR, charts, documents, dense UI screenshots, and anything where detail lives in fine structure, you are throwing away exactly the information the task needs.
+
+<AnyResDiagram caption="AnyRes keeps the encoder fixed and feeds it more of the image: split into native-resolution tiles plus a downscaled global thumbnail, each encoded separately — yielding many more visual tokens than a single naive resize, but preserving the fine detail." />
+
+## The fixed-resolution bottleneck
+
+Think about what a 336px ViT with patch size 14 actually produces: a grid of $336/14 = 24$ patches per side, so $24 \times 24 = 576$ visual tokens, regardless of how much detail the source contained. If your document was 2000px wide, each ViT patch corresponds to (after the downscale to 336px) roughly an $80 \times 80$ region of the 2000px original — fine detail in that region is resampled away before the encoder ever sees it. Small text is sub-patch. It is unrecoverable.
+
+You cannot simply crank the encoder's input resolution. ViT self-attention is quadratic in the number of patches, the positional embeddings were learned at the training resolution and degrade when interpolated far from it, and the encoder was contrastively pretrained at one scale — feed it something wildly different and the features drift off-distribution. Retraining a high-res encoder from scratch is expensive and, in 2024, not where most teams start.
+
+## AnyRes: tile at native resolution
+
+The AnyRes approach (popularized by LLaVA-NeXT) sidesteps all of that. Instead of resizing the whole image down to the encoder's native size, you keep the encoder fixed at its native resolution and feed it more of the image:
+
+1. Pick a grid layout that best fits the image's aspect ratio from a small candidate set — for example $2\times2$, $1\times3$, $3\times1$, $2\times3$ tiles, each tile being one full encoder input.
+2. Split the high-res image into that grid of sub-images, each at the encoder's native resolution (e.g. 336px). Encode every tile independently.
+3. Also encode a single downsized global thumbnail of the whole image, so the model keeps coarse layout and global context.
+4. Concatenate all the visual tokens — tiles plus thumbnail — into one sequence and project it into the LLM's embedding space.
+
+The encoder never sees an out-of-distribution input: every tile is a normal 336px crop. But the model now perceives the image at far higher effective resolution, because the spreadsheet cell that used to be three pixels is now part of a tile that gets a full 576-token budget.
+
+The cost is in the token count. Here $g$ is the total tile count — that is, $g = \text{rows} \times \text{cols}$ — so the grids listed above give $g \in \{3, 4, 6\}$, and a wider set of configured grid options widens that set. With a grid of $g$ tiles plus one thumbnail, and $T$ tokens per encoder pass, a single image yields roughly
+
+$$
+N_{\text{visual}} = (g + 1)\,T \quad\text{tokens.}
+$$
+
+A $336$px tile gives $T = 576$; configurations often unpad tiles (removing padding tokens introduced to fit the image to the grid's aspect ratio), and some drop tokens to fit a fixed visual-token budget — not to remove redundant content. The key fact for everything downstream: **$N_{\text{visual}}$ is variable per sample**, and for a dense document it can be several thousand tokens before the text prompt is even appended. A batch of images is no longer a clean fixed-shape tensor.
+
+```python
+# illustrative -- not a real implementation
+def anyres_tokens(image, encoder, grid_options):
+    grid = pick_best_grid(image.size, grid_options)   # e.g. (2, 3)
+    tiles = split_into_tiles(image, grid)             # each at 336x336
+    thumb = downsize(image, encoder.native_size)      # global context
+
+    tile_feats = [encoder(t) for t in tiles]          # each (576, d)
+    thumb_feat = encoder(thumb)                        # (576, d)
+
+    # variable-length: depends on the chosen grid
+    return concat(tile_feats + [thumb_feat])          # (N_visual, d)
+```
+
+## Why this lands on the data pipeline
+
+Here is the payoff, and the part that actually consumes engineering time. AnyRes is a clean idea on the modeling side. Its real consequence shows up when you try to do preference optimization at scale on top of a VLM.
+
+Direct Preference Optimization (DPO) trains on pairs: a prompt $x$, a chosen response $y_w$, and a rejected response $y_l$. It optimizes the policy $\pi_\theta$ against a frozen reference policy $\pi_{\text{ref}}$ so that the implicit reward margin between chosen and rejected grows:
+
+$$
+\mathcal{L}_{\text{DPO}} = -\,\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma\!\left( \beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \right) \right].
+$$
+
+For text DPO, $x$ is just a token sequence. For multimodal DPO, $x$ includes an image — and that image expands, via AnyRes, into a variable-length blob of visual tokens that has to be present for both the chosen and rejected forward passes. So three things that were easy in text-land get hard.
+
+**1. Precompute and cache the visual features.** Running the vision encoder on every tile of every image on every training step is wasteful — when the encoder is frozen, its output never changes. You precompute the AnyRes tile features once and cache them per sample. This caching is only valid when the encoder is frozen, and you should cache raw encoder features (not projected tokens) unless the projector is also frozen — unfreezing the encoder invalidates this optimization entirely, and a trainable projector makes cached projected tokens stale. But because $N_{\text{visual}}$ varies, the cache holds ragged, variable-length arrays. You store the length alongside the features so the dataloader can pack and pad correctly, and you key the cache on a content hash of the image plus the grid configuration so a config change invalidates cleanly.
+
+**2. One data format across text and multimodal.** A preference-tuning run rarely uses images alone; you mix text-only and multimodal pairs. If text samples and multimodal samples flow through different code paths, batching and loss masking become a swamp of special cases. The fix is one record schema where the visual-token field is simply empty for text samples and a variable-length array for multimodal ones. Every record carries: prompt tokens, chosen tokens, rejected tokens, an optional visual-feature blob with its length, and the loss mask. Same collation logic for both.
+
+**3. Precompute reference log-probs.** $\pi_{\text{ref}}$ is frozen, so $\log \pi_{\text{ref}}(y_w \mid x)$ and $\log \pi_{\text{ref}}(y_l \mid x)$ never change during training. Computing them on the fly means keeping a full second copy of the model resident and running it every step — for a VLM with thousands of visual tokens per sample, that adds a second full forward pass (the frozen reference model) on top of every training step. Instead, do one offline pass: for each pair, run the reference policy once over the AnyRes-expanded input and store the two scalar reference log-probs in the record. Training then only forwards $\pi_\theta$, and the DPO loss reads the cached reference scalars. The scalar shortcut covers most sequence-level objectives — vanilla DPO and IPO both reduce to the same cached log-ratio. It breaks for genuinely *token-level* objectives (e.g. TDPO), which need per-token reference logprobs cached instead of a single scalar; and length-normalized variants additionally need the response length stored. (An auxiliary SFT/NLL term is different again — it's computed on the *policy's* logprobs of the chosen response, so it touches no reference scalars at all.)
+
+```python
+# illustrative -- not a real implementation
+def build_record(sample, encoder, ref_policy):
+    visual = anyres_tokens(sample.image, encoder, GRIDS) if sample.image else None
+    x = assemble_inputs(sample.prompt, visual)        # variable length
+
+    # reference log-probs are constant -> compute once, store scalars
+    ref_lp_w = ref_policy.logprob(sample.chosen, x)
+    ref_lp_l = ref_policy.logprob(sample.rejected, x)
+
+    return {
+        "prompt": tokenize(sample.prompt),
+        "chosen": tokenize(sample.chosen),
+        "rejected": tokenize(sample.rejected),
+        "visual": visual,                 # None for text-only
+        "visual_len": len(visual) if visual is not None else 0,
+        "ref_lp_chosen": ref_lp_w,
+        "ref_lp_rejected": ref_lp_l,
+    }
+```
+
+## Sharding so the dataloader isn't the bottleneck
+
+Once every sample is a self-contained record with possibly-large visual features baked in, the records are big and you cannot fit the dataset in memory. The standard answer is WebDataset: serialize records into sharded `.tar` files and stream them. Each shard is a few hundred MB to a couple GB, holds a contiguous run of records, and is read sequentially — which is exactly what object stores and spinning disks are fast at.
+
+The subtlety is shard packing under data parallelism. With $D$ data-parallel ranks, you want each rank to own a disjoint set of shards with roughly equal total token volume — not equal sample count. Because AnyRes makes $N_{\text{visual}}$ variable, a shard full of dense documents carries far more tokens than a shard of text-only pairs. If you pack naively by sample count and assign round-robin, one rank ends up chewing through document-heavy shards while others idle, and the slowest rank gates every step. So you estimate per-record token cost up front, greedily balance shards by total tokens, and align the shard count to a multiple of $D$ so assignment is clean and every rank streams a comparable workload. Do this and the streaming dataloader stays ahead of the GPUs instead of becoming the wall everything backs up against.
+
+## So what
+
+AnyRes is a pragmatic answer to a real limitation: a frozen, fixed-resolution encoder cannot see fine detail, so you tile the image at the encoder's native resolution and add a global thumbnail, accepting a variable and often large visual-token count in exchange for actually-readable detail. That single design choice — variable-length visual tokens — is what reshapes the whole multimodal DPO pipeline: precompute and cache ragged AnyRes features, unify text and multimodal under one record schema, precompute frozen reference log-probs, and shard into token-balanced WebDataset tars aligned to the data-parallel layout. None of it is glamorous, but it's the difference between a trainer that's GPU-bound and one that starves waiting on I/O.
+
+Worth dating this honestly: AnyRes is the state of multimodal practice circa late 2024. Native high-resolution and dynamic-resolution encoders have since matured, shifting some of this work back into the model and shrinking the tiling gymnastics — but the data-pipeline lessons about variable-length features, reference-logprob caching, and token-balanced sharding carry over regardless of how the pixels get encoded.

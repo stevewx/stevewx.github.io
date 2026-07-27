@@ -1,0 +1,54 @@
+---
+import type { CollectionEntry } from "astro:content";
+import FormattedDate from "./FormattedDate.astro";
+import { getLocaleFromPath } from "../i18n/config";
+import { t } from "../i18n/ui";
+import { postHref } from "../i18n/content";
+
+interface Props {
+  post: CollectionEntry<"blog">;
+  /** Compact variant for the homepage featured list. */
+  compact?: boolean;
+}
+
+const { post, compact = false } = Astro.props;
+const { title, description, date, category, tags } = post.data;
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+const s = t(locale);
+const href = postHref(post);
+---
+
+<article class="card group p-5">
+  <a href={href} class="block">
+    <div class="flex flex-wrap items-center gap-3 text-xs">
+      <span class="font-mono text-accent-muted">{s.categories[category]}</span>
+      <span class="text-slate-600">·</span>
+      <FormattedDate date={date} class="font-mono text-slate-500" />
+    </div>
+
+    <h3
+      class="mt-2 text-lg font-semibold text-slate-100 transition-colors group-hover:text-accent"
+    >
+      {title}
+    </h3>
+
+    {
+      !compact && (
+        <p class="mt-2 line-clamp-2 text-sm leading-relaxed text-slate-400">
+          {description}
+        </p>
+      )
+    }
+
+    {
+      tags.length > 0 && !compact && (
+        <ul class="mt-4 flex flex-wrap gap-2">
+          {tags.slice(0, 4).map((tag) => (
+            <li class="font-mono text-[11px] text-slate-500">#{tag}</li>
+          ))}
+        </ul>
+      )
+    }
+  </a>
+</article>

@@ -1,0 +1,81 @@
+---
+import { SITE } from "../consts";
+import ThemeScript from "./ThemeScript.astro";
+import { getLocaleFromPath, switchLocalePath } from "../i18n/config";
+import { t } from "../i18n/ui";
+import "../styles/global.css";
+// Self-hosted via npm, not CDN.
+import "katex/dist/katex.min.css";
+
+interface Props {
+  title?: string;
+  description?: string;
+  /** Path to an OG image under /public, or remote URL. */
+  image?: string;
+  /** Mark as an article for OG (blog posts). */
+  article?: boolean;
+}
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+const strings = t(locale);
+
+const {
+  title = strings.site.title,
+  description = strings.site.description,
+  image = "/og-default.png",
+  article = false,
+} = Astro.props;
+
+const canonical = new URL(Astro.url.pathname, Astro.site ?? SITE.url);
+const ogImage = new URL(image, Astro.site ?? SITE.url);
+
+// hreflang: point each locale at this same page's counterpart.
+const base = Astro.site ?? SITE.url;
+const enHref = new URL(switchLocalePath(Astro.url.pathname, "en"), base);
+const zhHref = new URL(switchLocalePath(Astro.url.pathname, "zh"), base);
+const ogLocale = locale === "zh" ? "zh_CN" : "en_US";
+---
+
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<ThemeScript />
+<link rel="canonical" href={canonical} />
+<meta name="generator" content={Astro.generator} />
+
+<title>{title}</title>
+<meta name="title" content={title} />
+<meta name="description" content={description} />
+<meta name="author" content={SITE.author} />
+
+<link rel="alternate" hreflang="en" href={enHref} />
+<link rel="alternate" hreflang="zh-Hans" href={zhHref} />
+<link rel="alternate" hreflang="x-default" href={enHref} />
+
+<meta property="og:type" content={article ? "article" : "website"} />
+<meta property="og:url" content={canonical} />
+<meta property="og:title" content={title} />
+<meta property="og:description" content={description} />
+<meta property="og:image" content={ogImage} />
+<meta property="og:site_name" content={strings.site.name} />
+<meta property="og:locale" content={ogLocale} />
+
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content={title} />
+<meta name="twitter:description" content={description} />
+<meta name="twitter:image" content={ogImage} />
+
+<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+<link rel="sitemap" href="/sitemap-index.xml" />
+<link
+  rel="alternate"
+  type="application/rss+xml"
+  title={strings.site.name}
+  href={new URL("rss.xml", Astro.site ?? SITE.url)}
+/>
+
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+  rel="stylesheet"
+/>

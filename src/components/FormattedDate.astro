@@ -1,0 +1,20 @@
+---
+import { getLocaleFromPath, DATE_LOCALE } from "../i18n/config";
+
+interface Props {
+  date: Date;
+  class?: string;
+}
+const { date, class: className } = Astro.props;
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+
+const formatted = date.toLocaleDateString(DATE_LOCALE[locale], {
+  year: "numeric",
+  month: locale === "zh" ? "long" : "short",
+  day: "numeric",
+  timeZone: "UTC",
+});
+---
+
+<time datetime={date.toISOString()} class={className}>{formatted}</time>

@@ -1,0 +1,26 @@
+---
+/**
+ * No-flash theme bootstrap. Runs synchronously in <head> BEFORE first paint,
+ * so the correct palette is applied with zero flash of the wrong theme.
+ *
+ * Policy (auto + remember): an explicit choice in localStorage wins; otherwise
+ * the OS preference drives it via CSS media query (no class added here). We
+ * only add a class when the user has explicitly chosen, keeping "auto" truly
+ * following the system until the user opts out.
+ */
+---
+
+<script is:inline>
+  (() => {
+    try {
+      const stored = localStorage.getItem("theme");
+      const root = document.documentElement;
+      if (stored === "dark" || stored === "light") {
+        root.classList.add(stored);
+      }
+      // else: no class — global.css @media(prefers-color-scheme) decides.
+    } catch (_) {
+      /* localStorage unavailable (private mode / blocked) — fall back to OS. */
+    }
+  })();
+</script>

@@ -1,0 +1,39 @@
+---
+import BaseHead from "../components/BaseHead.astro";
+import Header from "../components/Header.astro";
+import Footer from "../components/Footer.astro";
+import { getLocaleFromPath, HTML_LANG, type Locale } from "../i18n/config";
+
+interface Props {
+  title?: string;
+  description?: string;
+  image?: string;
+  article?: boolean;
+  /** Explicit per-locale language-switch targets (blog posts pass these). */
+  langSwitchHref?: Partial<Record<Locale, string>>;
+}
+
+const { title, description, image, article, langSwitchHref } = Astro.props;
+
+// Single source of truth for the active locale: the URL path (/zh/... → zh).
+const locale = getLocaleFromPath(Astro.url.pathname);
+---
+
+<!doctype html>
+<html lang={HTML_LANG[locale]}>
+  <head>
+    <BaseHead
+      title={title}
+      description={description}
+      image={image}
+      article={article}
+    />
+  </head>
+  <body class="flex min-h-screen flex-col">
+    <Header langSwitchHref={langSwitchHref} />
+    <main class="flex flex-1 flex-col">
+      <slot />
+    </main>
+    <Footer />
+  </body>
+</html>

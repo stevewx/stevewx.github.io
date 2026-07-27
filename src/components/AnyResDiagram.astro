@@ -1,0 +1,326 @@
+---
+/**
+ * AnyRes diagram: high-res image → split into native-res tiles + global
+ * thumbnail → frozen ViT → many visual tokens. Content carries from the image
+ * into the tiles so it reads as "split one image", not "merge squares"; the
+ * naive-resize contrast (576 tokens, detail lost) is the point.
+ * Inline SVG so it inherits the dark theme and adds no HTTP request.
+ */
+interface Props {
+  caption?: string;
+}
+const { caption } = Astro.props;
+
+// Colors come from the scoped CSS classes below so the diagram flips with the
+// theme: SVG presentation attributes can't read var(), hence classes.
+
+// "Document" content in normalized [0,1] image coords, drawn whole (image +
+// thumbnail) and clipped per quadrant in tiles — so each tile is a crop of it.
+type Line = { x: number; y: number; w: number };
+const docLines: Line[] = [
+  { x: 0.1, y: 0.14, w: 0.78 },
+  { x: 0.1, y: 0.26, w: 0.6 },
+  { x: 0.1, y: 0.38, w: 0.72 },
+  { x: 0.55, y: 0.58, w: 0.34 },
+  { x: 0.55, y: 0.7, w: 0.3 },
+  { x: 0.55, y: 0.82, w: 0.33 },
+];
+type Bar = { x: number; top: number; w: number };
+const docBars: Bar[] = [
+  { x: 0.12, top: 0.66, w: 0.07 },
+  { x: 0.22, top: 0.58, w: 0.07 },
+  { x: 0.32, top: 0.72, w: 0.07 },
+];
+const BAR_BASE = 0.9;
+
+type Rect = { x: number; y: number; w: number; h: number };
+
+function whole(box: Rect, lineH: number): Rect[] {
+  const out: Rect[] = [];
+  for (const l of docLines) {
+    out.push({
+      x: box.x + l.x * box.w,
+      y: box.y + l.y * box.h,
+      w: l.w * box.w,
+      h: lineH,
+    });
+  }
+  for (const b of docBars) {
+    out.push({
+      x: box.x + b.x * box.w,
+      y: box.y + b.top * box.h,
+      w: b.w * box.w,
+      h: (BAR_BASE - b.top) * box.h,
+    });
+  }
+  return out;
+}
+
+// Crop one quadrant into a tile box. col,row in {0,1}; each quadrant spans 0.5.
+function crop(col: number, row: number, box: Rect, lineH: number): Rect[] {
+  const qx0 = col * 0.5,
+    qx1 = qx0 + 0.5,
+    qy0 = row * 0.5,
+    qy1 = qy0 + 0.5;
+  const sx = box.w / 0.5,
+    sy = box.h / 0.5;
+  const out: Rect[] = [];
+  for (const l of docLines) {
+    if (l.y < qy0 || l.y >= qy1) continue;
+    const x0 = Math.max(l.x, qx0);
+    const x1 = Math.min(l.x + l.w, qx1);
+    if (x1 <= x0) continue;
+    out.push({
+      x: box.x + (x0 - qx0) * sx,
+      y: box.y + (l.y - qy0) * sy,
+      w: (x1 - x0) * sx,
+      h: lineH,
+    });
+  }
+  for (const b of docBars) {
+    const bTop = Math.max(b.top, qy0);
+    const bBot = Math.min(BAR_BASE, qy1);
+    if (bBot <= bTop) continue;
+    if (b.x < qx0 || b.x >= qx1) continue;
+    out.push({
+      x: box.x + (b.x - qx0) * sx,
+      y: box.y + (bTop - qy0) * sy,
+      w: b.w * sx,
+      h: (bBot - bTop) * sy,
+    });
+  }
+  return out;
+}
+
+const imgBox: Rect = { x: 40, y: 48, w: 140, h: 140 };
+const imageRects = whole(imgBox, 4);
+
+// 2×2, gapped so they read as separate crops
+const TILE = 60;
+const TGAP = 8;
+const tilesX = 252;
+const tilesY = 48;
+const tiles = [
+  { col: 0, row: 0 },
+  { col: 1, row: 0 },
+  { col: 0, row: 1 },
+  { col: 1, row: 1 },
+].map(({ col, row }) => {
+  const box: Rect = {
+    x: tilesX + col * (TILE + TGAP),
+    y: tilesY + row * (TILE + TGAP),
+    w: TILE,
+    h: TILE,
+  };
+  return { box, rects: crop(col, row, box, 2.5) };
+});
+
+const thumbBox: Rect = { x: 300, y: 224, w: 42, h: 42 };
+const thumbRects = whole(thumbBox, 1.5);
+
+const tokenRows = [70, 96, 122, 148].map((y) => ({ y, dim: false }));
+tokenRows.push({ y: 196, dim: true });
+const TOKENS_PER_ROW = 14;
+---
+
+<figure class="my-8 not-prose">
+  <div class="rounded-lg border border-ink-700 bg-ink-950 p-4 sm:p-6 grid-dots">
+    <svg
+      viewBox="0 0 820 300"
+      role="img"
+      aria-label="AnyRes tiling: a high-resolution document image is split into four native-resolution tiles (each a crop of the original) plus a downscaled global thumbnail, each encoded by a frozen ViT into visual tokens, yielding far more tokens than a single naive resize."
+      class="h-auto w-full"
+      font-family="'JetBrains Mono', ui-monospace, monospace"
+    >
+      <text x="40" y="22" class="f-slate500" font-size="13">① high-res input</text
+      >
+      <text x="252" y="22" class="f-slate500" font-size="13"
+        >② split into tiles (+ thumbnail)</text
+      >
+      <text x="540" y="22" class="f-slate500" font-size="13"
+        >③ frozen ViT → tokens</text
+      >
+
+      <rect
+        x={imgBox.x}
+        y={imgBox.y}
+        width={imgBox.w}
+        height={imgBox.h}
+        class="f-accent s-line"
+        fill-opacity="0.03"
+        stroke-width="1.5"
+        rx="3"></rect>
+      {
+        imageRects.map((r) => (
+          <rect
+            x={r.x}
+            y={r.y}
+            width={r.w}
+            height={r.h}
+            rx="1"
+            class="f-accent"
+            opacity="0.4"
+          />
+        ))
+      }
+      <text x="110" y="208" class="f-slate400" font-size="12" text-anchor="middle"
+        >high-res image</text
+      >
+      <text x="110" y="224" class="f-slate500" font-size="10" text-anchor="middle"
+        >e.g. 672×672</text
+      >
+
+      <line
+        x1="190"
+        y1="118"
+        x2="240"
+        y2="118"
+        class="s-accent"
+        stroke-width="1.5"></line>
+      <path d="M240 118 l-7 -4 l0 8 z" class="f-accent"></path>
+
+      {
+        tiles.map((t) => (
+          <g>
+            <rect
+              x={t.box.x}
+              y={t.box.y}
+              width={t.box.w}
+              height={t.box.h}
+              class="f-accent s-accent"
+              fill-opacity="0.03"
+              stroke-opacity="0.55"
+              stroke-width="1"
+              rx="2"
+            />
+            {t.rects.map((r) => (
+              <rect
+                x={r.x}
+                y={r.y}
+                width={r.w}
+                height={r.h}
+                rx="1"
+                class="f-accent"
+                opacity="0.4"
+              />
+            ))}
+          </g>
+        ))
+      }
+      <text x="316" y="208" class="f-slate400" font-size="12" text-anchor="middle"
+        >4 native-res tiles</text
+      >
+
+      <rect
+        x={thumbBox.x}
+        y={thumbBox.y}
+        width={thumbBox.w}
+        height={thumbBox.h}
+        class="f-slate400 s-slate500"
+        fill-opacity="0.03"
+        stroke-width="1"
+        rx="2"></rect>
+      {
+        thumbRects.map((r) => (
+          <rect
+            x={r.x}
+            y={r.y}
+            width={r.w}
+            height={r.h}
+            class="f-slate400"
+            opacity="0.35"
+          />
+        ))
+      }
+      <text x="323" y="286" class="f-slate500" font-size="10" text-anchor="middle"
+        >+ 1 global thumbnail</text
+      >
+
+      <line
+        x1="392"
+        y1="92"
+        x2="470"
+        y2="92"
+        class="s-accent"
+        stroke-width="1.5"></line>
+      <path d="M470 92 l-7 -4 l0 8 z" class="f-accent"></path>
+
+      <rect
+        x="478"
+        y="48"
+        width="16"
+        height="160"
+        class="f-accent s-accentDim"
+        fill-opacity="0.08"
+        stroke-width="1"
+        rx="3"></rect>
+      <text
+        x="486"
+        y="128"
+        class="f-accent"
+        font-size="11"
+        text-anchor="middle"
+        dominant-baseline="central"
+        transform="rotate(-90 486 128)">ViT</text
+      >
+
+      {
+        tokenRows.map((tr) =>
+          Array.from({ length: TOKENS_PER_ROW }).map((_, k) => (
+            <rect
+              x={508 + k * 12}
+              y={tr.y}
+              width="9"
+              height="9"
+              rx="1.5"
+              class={tr.dim ? "f-slate400" : "f-accent"}
+              opacity={tr.dim ? 0.32 : 0.5}
+            />
+          )),
+        )
+      }
+      <text x="508" y="240" class="f-accent" font-size="14"
+        >5 × 576 = 2,880 visual tokens</text
+      >
+      <text x="508" y="262" class="f-slate500" font-size="10.5"
+        >vs. a naive resize → just 576 · detail lost</text
+      >
+    </svg>
+  </div>
+  {
+    caption && (
+      <figcaption class="mt-2 text-center font-mono text-xs text-slate-500">
+        {caption}
+      </figcaption>
+    )
+  }
+</figure>
+
+<style>
+  /* Fill/stroke here override the SVG presentation attributes; opacities stay
+   * as element attributes. */
+  .f-accent {
+    fill: rgb(var(--accent));
+  }
+  .s-accent {
+    stroke: rgb(var(--accent));
+  }
+  .s-accentDim {
+    stroke: rgb(var(--accent-dim));
+  }
+  .s-line {
+    stroke: rgb(var(--ink-700));
+  }
+  .f-slate400 {
+    fill: rgb(var(--slate-400));
+  }
+  .s-slate400 {
+    stroke: rgb(var(--slate-400));
+  }
+  .f-slate500 {
+    fill: rgb(var(--slate-500));
+  }
+  .s-slate500 {
+    stroke: rgb(var(--slate-500));
+  }
+</style>

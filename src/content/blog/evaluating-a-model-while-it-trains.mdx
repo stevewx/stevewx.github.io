@@ -1,0 +1,124 @@
+---
+title: "Evaluating a Model While It Trains"
+description: "Why you cannot bolt evaluation onto a large-model RL trainer inline, and how the sidecar pattern gives you continuous per-checkpoint quality curves without ever stalling the training loop."
+date: 2024-02-12
+category: work
+author: Xuan Wang
+tags: ["eval-automation","checkpointing","rlhf","ppo","mlops"]
+featured: false
+draft: false
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+You launch a multi-day PPO run on a policy model that already eats most of your GPU memory. A day in, someone asks the obvious question: is it actually getting better? You have reward curves, sure, but reward-on-the-training-distribution is not the same as quality on the benchmarks you care about. So you reach for the natural-seeming fix: drop an eval call into the training loop, run it every few hundred steps, and log the numbers.
+
+That fix tends to detonate. The first eval pass either pushes the trainer into an out-of-memory crash, or it stalls every worker for the duration of the eval, turning an expensive synchronized job into an expensive synchronized waiting room. The lesson that shows up fast in production is that evaluation of a large RL checkpoint belongs **off** the training critical path, in a separate process that watches for new checkpoints and does its own thing. That separate process is the sidecar.
+
+<SceneFigure scene="sidecar" height={160} caption="Trainer writes checkpoints; a decoupled sidecar picks them up, converts format, serves, evaluates, and logs — never blocking the loop." />
+
+## Why inline eval bites
+
+Two problems, and they compound.
+
+**Memory contention.** A PPO setup for RLHF is already holding a lot of state on device — the classic four-model dance, plus everything training drags along: the policy weights ($M_{\text{policy}}$), a reference model for the KL penalty ($M_{\text{ref}}$, usually policy-sized), a value/critic model ($M_{\text{critic}}$ — often a separate network, sometimes a head on a shared backbone), a reward model to score rollouts ($M_{\text{rm}}$, often comparable to the critic, and typically colocated in this era's setups), the optimizer states ($M_{\text{optim}}$: Adam in mixed precision is about 12 bytes per parameter — two fp32 moment buffers plus an fp32 master copy — on top of the working bf16/fp16 params, and both trainable models carry it), the gradients ($M_{\text{grad}}$), and activations ($M_{\text{act}}$: the intermediate tensors saved during the forward pass for the backward pass — scaling with batch × sequence length × hidden size × layers). Generation during eval then needs a KV cache ($M_{\text{kv}}$) that scales with batch size and sequence length. If you try to stand up an inference path inside the same process, you are asking for peak memory that looks roughly like
+
+$$
+M_{\text{peak}} \approx M_{\text{policy}} + M_{\text{ref}} + M_{\text{critic}} + M_{\text{rm}} + M_{\text{optim}} + M_{\text{grad}} + M_{\text{act}} + M_{\text{kv}}
+$$
+
+The training pieces already sit close to the device ceiling by design — you size the run to use the hardware. Adding $M_{\text{kv}}$ for a decode-heavy benchmark on top of that can be what tips it into OOM. And an OOM in a distributed trainer is rarely a clean retry; it often takes down a rank, and without elastic restart can bring the whole job with it.
+
+**Loop stalls.** Even if you somehow fit it, generation is slow and sequential per token within a sequence (though many sequences can decode in parallel). A benchmark suite that takes, say, ten minutes to decode is ten minutes where the optimizer is doing nothing. On a synchronized data-parallel job, the slowest rank gates everyone, so eval-on-one-rank still idles the rest. You are paying full-cluster cost for a single-process workload. Over a multi-day run with frequent eval, that overhead is not a rounding error — it is a meaningful fraction of wall-clock and budget.
+
+The clean way to think about it: training wants throughput and steady memory pressure; eval wants latency-tolerant, bursty generation. These are different workloads with different resource profiles. Forcing them into one process means each degrades the other.
+
+## The sidecar: decouple by checkpoint
+
+The trainer's job is to train and to emit checkpoints. That is the only contract. Everything evaluation-related lives in a companion process — the sidecar — whose entire purpose is to turn "a new checkpoint appeared" into "a row of metrics in the experiment tracker."
+
+The handoff is the checkpoint on shared storage. The trainer writes; the sidecar watches. They never share a GPU, never share a Python process, and never block each other. If the sidecar falls behind, falls over, or you redeploy it mid-run, training does not notice. That is the whole point — eval failures must be non-events for the trainer.
+
+```python
+# illustrative — not a real implementation
+def watch_and_evaluate(ckpt_dir, tracker):
+    seen = set()
+    while training_is_live(ckpt_dir):
+        for ckpt in sorted(new_checkpoints(ckpt_dir)):
+            if ckpt in seen:
+                continue
+            seen.add(ckpt)
+            try:
+                hf_model = convert_to_inference_format(ckpt)
+                server = serve(hf_model)              # own GPUs, own process
+                metrics = run_benchmark_suite(server)
+                tracker.log(step=step_of(ckpt), metrics=metrics)
+            except Exception as err:
+                tracker.log_warning(ckpt, err)        # never crash the watcher
+        sleep(POLL_INTERVAL)
+```
+
+Note the `try`/`except` wrapping the whole per-checkpoint body. A malformed checkpoint, a flaky server start, a benchmark timeout — none of these should kill the watcher. Log it, move on, the next checkpoint gets a fresh attempt.
+
+## Step one: convert the checkpoint format
+
+This is the part people underestimate. The format a trainer writes is not the format an inference server reads.
+
+A distributed RL trainer shards parameters across ranks and saves them in that sharded layout, interleaved with optimizer states, the value model, RNG state, and step counters. How far that is from what an inference engine wants — a consolidated Hugging Face-style directory with a `config.json`, a tokenizer, and a `model.safetensors` (or sharded `safetensors` with an index) — depends entirely on the training backend:
+
+- **FSDP or DeepSpeed-ZeRO wrapping a stock HF model** is the easy case. The parameters keep their original HF names; the framework only flattened and sharded them. A full-state-dict save gathers the shards, strips the wrapper prefix, drops the optimizer state, and you essentially have an HF checkpoint — *no layout or name transformation*.
+- **Megatron-style trainers** (Megatron-LM and NeMo — the common path for large-scale training) are the hard case, and the reason this step has a reputation. The on-disk model is genuinely *not* HF: tensor-parallel shards to merge, pipeline stages to stitch, a **fused QKV stored interleaved per head**, fused gate/up MLP projections, vocab-parallel embeddings, and Megatron-specific parameter names. This is a real, bug-prone Megatron→HF conversion, not a rename.
+
+So in the Megatron case the conversion step has to:
+
+- gather and merge the tensor/pipeline-parallel shards back into full parameter tensors,
+- drop everything inference does not need (optimizer states, the value/critic model — the frozen reference model was never checkpointed to begin with, since it's reloaded from the base weights),
+- un-fuse and de-interleave QKV and MLP projections and remap Megatron parameter names to the names the HF architecture expects,
+- and write out the config and tokenizer so the server can load it standalone.
+
+```python
+# illustrative — not a real implementation
+def convert_to_inference_format(ckpt):
+    shards = load_sharded(ckpt)                 # per-rank tensors
+    full = gather_full_params(shards)           # un-shard to whole tensors
+    weights = {
+        remap_name(k): v
+        for k, v in full.items()
+        if is_policy_param(k)                   # skip critic / optim state
+    }
+    write_safetensors(weights, ckpt.hf_path)
+    write_config_and_tokenizer(ckpt.hf_path)
+    return ckpt.hf_path
+```
+
+Two things matter here. First, get the tensor handling exactly right. A pure name mismatch usually fails loudly — missing or unexpected keys on load — so the dangerous case is the *silent* one: correct names but a wrong layout (a transposed weight, swapped QKV order, wrong dtype) that loads cleanly and evaluates noise, which is worse than no eval because it looks plausible. Guard with both a strict key assertion and a cheap numerical sanity check — e.g. confirm the converted model's logits match the trainer's on a fixed batch. Second, this gather can itself be memory-hungry, which is another reason it runs in the sidecar and not the trainer: you do not want the un-sharding to compete with live training memory either.
+
+## Step two: tiered evaluation
+
+Not every checkpoint deserves the full suite, and not every signal needs to wait for it. Split eval into tiers by cost and latency.
+
+**Smoke tier — fast, frequent, almost-inline.** A tiny fixed set of prompts (think tens, not thousands), greedy decode, short max-new-tokens. It answers one question: did this checkpoint regress catastrophically — degenerate repetition, broken formatting, gross refusal collapse? (A small greedy set catches only the obvious breakage here; refusal-*rate* drift is prompt- and sampling-sensitive, so leave that to the full tier.) It is cheap enough to run on nearly every checkpoint and gives you an early tripwire. You can run this on a small slice of borrowed capacity without standing up the heavy server.
+
+**Full tier — expensive, batched, offline.** The real benchmark suite: held-out preference sets, capability benchmarks, safety probes (including refusal-rate tracking), longer generations, maybe sampled decoding with multiple seeds. This is where you stand up the proper inference server and push large batches through it. It runs on its own schedule — every Nth checkpoint, or whenever the smoke tier looks healthy — and it can lag the trainer by a checkpoint or two without anyone caring.
+
+The tiers map onto the OOM and stall problems directly. The smoke tier is cheap enough that its small footprint and short runtime do not threaten anything. The full tier is the one that would have blown up inline, so it lives fully offline, fully batched, on separate resources, where latency does not matter because nothing is waiting on it.
+
+## Step three: continuous per-checkpoint curves
+
+Because every checkpoint flows through the same pipeline and lands in the same tracker keyed by training step, you get something inline eval never gives you cleanly: a continuous quality curve in the same time axis as your reward and KL curves.
+
+That alignment is where the value is. You can overlay benchmark accuracy against the KL-to-reference penalty and literally see the over-optimization knee — the point where reward keeps climbing but real quality plateaus or turns down because the policy is gaming the reward model. Concretely, if you track quality $Q(t)$ at step $t$ against
+
+$$
+\text{reward}(t) - \beta \, \mathrm{KL}\!\left(\pi_t \,\|\, \pi_{\text{ref}}\right)
+$$
+
+you can pick the checkpoint that maximizes held-out quality rather than the one that maximizes training reward — and those are frequently not the same checkpoint. Picking the right one is a selection decision you can only make if you measured every candidate, which is exactly what the sidecar buys you.
+
+The tracker (MLflow-style: experiments, runs, per-step metrics, artifacts) becomes the source of truth. Each row is a checkpoint; each column is a benchmark; the step axis lines up with training. Run comparison, regression detection, and final checkpoint selection all read from there.
+
+## So what
+
+The instinct to evaluate inline is reasonable and wrong at scale. A large-model RL trainer is already sized to its hardware, and evaluation is a different workload — bursty generation with its own memory and latency profile — that does not coexist with synchronized optimization. Forcing them together gets you OOM crashes and stalled clusters.
+
+The sidecar pattern resolves this by making the checkpoint the only contract between the two. The trainer trains and writes; a decoupled watcher converts each checkpoint from the sharded training format to a standalone inference format, serves it, runs a tiered benchmark suite, and logs per-checkpoint metrics — entirely off the critical path. Eval failures become non-events. And the payoff is a continuous, step-aligned quality curve that lets you select checkpoints on real quality instead of training reward. The decoupling is not a nice-to-have; it is what makes the measurement possible at all.

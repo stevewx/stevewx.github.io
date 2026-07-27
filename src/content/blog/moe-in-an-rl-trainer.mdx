@@ -1,0 +1,227 @@
+---
+title: "What Changes When You Put an MoE Model in an RL Trainer"
+description: "A sparse Mixture-of-Experts model has huge total parameters but modest active ones. Drop it into a PPO-family post-training pipeline and the sparsity that made pretraining cheap starts breaking memory, rollout, routing, and your LoRA assumptions."
+date: 2024-07-22
+category: work
+author: Xuan Wang
+tags: ["moe","expert-parallelism","ppo","routing","training"]
+featured: false
+draft: false
+references:
+  - authors: "Fedus et al., 2021"
+    title: "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity"
+    url: "https://arxiv.org/abs/2101.03961"
+    note: "top-1 routing and the load-balancing auxiliary loss"
+  - authors: "Jiang et al., 2024"
+    title: "Mixtral of Experts"
+    url: "https://arxiv.org/abs/2401.04088"
+    note: "top-2 routing; 13B active / 47B total"
+  - authors: "Lepikhin et al., 2020"
+    title: "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding"
+    url: "https://arxiv.org/abs/2006.16668"
+    note: "expert parallelism and all-to-all dispatch/combine"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+A Mixture-of-Experts model is a strange object to hold in your head: it can have
+hundreds of billions of parameters yet spend, per token, about as few FLOPs as a
+model a fraction of its size. That trade is exactly why MoE is everywhere in
+pretraining. But an RL post-training pipeline (PPO, GRPO, RLOO — the policy-gradient
+family) was mostly designed around *dense* models, and the sparsity that made
+pretraining cheap quietly violates several of its assumptions at once. This post
+walks the dense FFN to its sparse replacement, then through the four places it
+bites once you wire it into an RL trainer.
+
+<SceneFigure
+  scene="moe-routing"
+  height={160}
+  caption="A token enters the MoE layer, the router scores the experts, and only the top-k light up. Most experts stay dark for any given token — that is the sparsity, and the source of all the trouble downstream."
+/>
+
+## From one dense FFN to many sparse experts
+
+In a standard transformer block, each token passes through a single
+feed-forward network — one big shared matrix multiply that every token sees. A
+sparse MoE layer replaces that one FFN with $N$ parallel **expert** FFNs plus a
+small learned **router**. The router scores the experts for each token and sends
+the token to only the top-$k$ of them (often $k=1$ as in Switch Transformer, or
+$k=2$ as in Mixtral 8x7B).
+
+Concretely, for a token hidden state $x$, the router produces gate logits, takes
+a softmax over the selected experts, and combines their outputs:
+
+$$
+g(x) = \mathrm{softmax}\big(\mathrm{TopK}(W_r\, x,\; k)\big),
+\qquad
+y = \sum_{i \in \mathrm{TopK}} g_i(x)\, E_i(x)
+$$
+
+This displayed form is the Mixtral-style convention — select the top-$k$ logits,
+then softmax over just those. Other designs differ: Switch Transformer softmaxes
+over all $N$ experts first and then takes the top-1. The accounting that follows
+is the whole point. **Total** parameters scale with $N$ — every expert is a full
+FFN sitting in memory. **Active** parameters per token scale with $k$. With
+$N=8$ experts and $k=2$, you store eight FFNs but compute two per token:
+
+$$
+P_{\text{total}} \sim N \cdot P_{\text{expert}},
+\qquad
+P_{\text{active}} \sim k \cdot P_{\text{expert}},
+\qquad
+\frac{P_{\text{active}}}{P_{\text{total}}} \approx \frac{k}{N}
+$$
+
+The ratio is $k/N$ counting only the expert FFNs; the whole-model active
+fraction runs a bit higher, since attention, the router, embeddings, and any
+shared always-on experts are active for every token — and, except for the tiny
+$d \times N$ router gate, don't grow with $N$ either (Mixtral lands at roughly
+13B active / 47B total, not exactly $2/8$). Either way, total params explode
+while per-token FLOPs stay modest. That decoupling is the gift in pretraining —
+and the bill comes due everywhere downstream.
+
+## Break #1: memory, and why expert parallelism is mandatory
+
+The first thing that breaks is the most basic: **fitting the model**.
+
+Per-token compute is small, but the *weights* are not. Every expert must live in
+GPU memory regardless of how rarely it fires. A naive data-parallel setup
+replicates the entire model on every GPU — which for a large MoE means each GPU
+must hold all $N$ experts of every layer. With total params in the hundreds of
+billions, that OOMs immediately.
+
+The standard answer is **expert parallelism (EP)**: shard the experts of a layer
+*across* GPUs so each device owns only $N / \text{EP}$ of them. No single GPU
+holds the full expert set. The catch is that routing now crosses device
+boundaries. A token on GPU 0 whose top-$k$ includes an expert on GPU 3 has to be
+*sent there* and its result sent back. That is an **all-to-all** collective,
+twice per MoE layer (dispatch and combine):
+
+$$
+\text{tokens} \xrightarrow[\text{dispatch}]{\text{all-to-all}}
+\text{experts on remote GPUs}
+\xrightarrow[\text{combine}]{\text{all-to-all}}
+\text{tokens}
+$$
+
+This communication does not exist in a dense model at all. In an RL trainer it
+can show up *twice over*: once in the policy network you are training, and again
+in the rollout engine generating trajectories *if* it too shards experts across
+GPUs (it might instead use tensor parallelism, or fit the experts without expert
+parallelism at all) — which is the next problem.
+
+## Break #2: the rollout engine has to speak MoE too
+
+RL post-training has a generation phase: the current policy autoregressively
+produces completions that get scored and turned into gradient signal. That
+generation almost always runs on a dedicated inference engine (vLLM, SGLang),
+*not* the training framework.
+
+For a dense model the engine just needs to run the architecture fast. For an MoE
+it must implement the **same routing semantics, with an expert layout correctly
+mapped from the trainer's** — the physical sharding can differ (a different EP
+degree, or tensor parallelism instead), but the logical expert numbering has to
+reconcile during weight conversion, or the engine runs a silently different
+model. Two requirements that are trivial for dense models become load-bearing
+here:
+
+- The inference engine needs an MoE-aware kernel path: top-$k$ routing, expert
+  dispatch, and its own all-to-all if it shards experts across inference GPUs.
+- The **train-side and inference-side expert layouts must agree** so that
+  checkpoint conversion is correct.
+
+That last point is a classic source of subtle bugs. If the trainer numbers and
+shards experts one way and the inference engine expects another, weight sync
+will quietly map expert $i$'s parameters onto expert $j$'s slot. Nothing crashes
+— the router still routes, the FFNs still multiply — but the policy you generate
+with is no longer the policy you trained. Off-by-one expert permutations are
+invisible to shape checks and lethal to learning.
+
+```python
+# illustrative — not a real implementation
+# sync trained weights into the rollout engine, expert-aware
+for layer in policy.moe_layers:
+    for i, expert in enumerate(layer.experts):
+        global_id = layer.local_to_global_expert_id(i)   # MUST match engine's map
+        engine.load_expert(layer.idx, global_id, expert.state_dict())
+# a wrong local_to_global map = correct shapes, wrong policy, broken RL
+```
+
+## Break #3: routing drift on off-distribution RL data
+
+MoE training relies on a **load-balancing auxiliary loss** to keep the router
+from collapsing onto a few favorite experts. The usual form penalizes the
+product of the fraction of tokens routed to each expert and the router's average
+probability mass on it:
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha \cdot N \sum_{i=1}^{N} f_i \cdot p_i
+$$
+
+where $f_i$ is the fraction of tokens dispatched to expert $i$ and $p_i$ is the
+mean gate probability for it. The product form is deliberate: $f_i$ is a hard
+count and non-differentiable, so the gradient flows only through the soft $p_i$
+while $f_i$ acts as a detached weighting. Minimized, this pushes the router
+toward roughly uniform utilization, so no expert is overloaded and none starves.
+It was tuned during pretraining, on the pretraining distribution.
+
+RL post-training does not feed that distribution. The data is **self-generated**:
+completions sampled from the current policy, filtered or weighted by reward.
+Reward chases a narrow slice of behavior — a particular format, a tool-call
+style, a domain — and the token distribution shifts with it. Two failure modes
+follow. The router can drift so that the policy's new behavior concentrates on a
+handful of experts, leaving capacity idle. Or, if you keep the aux loss strong,
+it fights the reward signal — forcing balance the data no longer wants and
+blunting the very behavior you are trying to shape. Tuning $\alpha$ against the
+reward objective is a knob dense RL never had to touch.
+
+## Break #4: attention-only LoRA underfits an MoE
+
+Parameter-efficient tuning is attractive in RL — full fine-tuning of a giant
+policy is expensive, and LoRA on the attention projections is the reflexive
+default carried over from dense models. On an MoE that default quietly
+underfits, and the reason is just the parameter accounting from the top of the
+post.
+
+In a dense transformer, attention and FFN are within the same order of magnitude
+— the FFN is the larger slice but not overwhelmingly so — so attention-only LoRA
+still touches a meaningful share. In an MoE, the **experts hold the overwhelming
+majority of the parameters** — the model is mostly FFN, replicated $N$ times.
+The router decides *which* behavior fires and the experts *are* that behavior.
+Freeze every expert and adapt only attention, and you are reshaping a thin shell
+around a frozen core:
+
+$$
+P_{\text{attn}} \ll P_{\text{experts}}
+\quad\Longrightarrow\quad
+\text{attention-only LoRA leaves most capacity untouched}
+$$
+
+If RL needs to move the policy's behavior more than marginally, the adapters
+have to reach the experts and ideally the router as well — expert LoRA, or
+selectively unfreezing experts — rather than stopping at the attention
+projections. The dense intuition that "LoRA on attention is usually enough"
+does not transport.
+
+## So what
+
+An MoE is not a drop-in for a dense policy in an RL trainer. The single property
+that makes it efficient — huge total parameters, sparse active ones — propagates
+into four distinct places:
+
+- **Memory:** experts do not fit replicated; **expert parallelism** is mandatory
+  and adds all-to-all routing communication that dense models never pay.
+- **Rollout:** the inference engine must implement MoE routing too, and its
+  expert-layout mapping must agree with the trainer's or checkpoint conversion
+  silently corrupts the policy.
+- **Routing:** the load-balancing aux loss was tuned on the pretraining
+  distribution; off-distribution RL data can skew routing, and the aux loss can
+  fight the reward signal.
+- **PEFT:** attention-only LoRA underfits, because the capacity — and the
+  behavior RL is trying to shape — lives in the experts.
+
+The throughline is to stop thinking of the MoE as one model and start thinking
+of it as $N$ experts plus a router that must stay consistent across training and
+inference, balanced against a reward signal that is actively trying to unbalance
+it. Get the expert bookkeeping right and the sparsity is still a gift; get it
+wrong and the failures are quiet, which is the worst kind.

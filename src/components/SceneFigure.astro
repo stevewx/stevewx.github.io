@@ -1,0 +1,65 @@
+---
+/**
+ * Embeds a specific training-themed FX scene as a captioned figure inside a
+ * blog post. Unlike FxBackground (random, full-bleed, behind text), this is a
+ * deliberate, bordered figure the reader looks AT.
+ *
+ * Usage in MDX:
+ *   import SceneFigure from "../../components/SceneFigure.astro";
+ *   <SceneFigure scene="pipeline" caption="Sync vs async RL scheduling." />
+ */
+interface Props {
+  scene:
+    | "token-flow"
+    | "pipeline"
+    | "tensor-rain"
+    | "attention"
+    | "kv-cache"
+    | "errors"
+    | "sidecar"
+    | "gqa-heads"
+    | "moe-routing"
+    | "checkpointing";
+  caption?: string;
+  /** Figure height in px (canvas draws to fill). */
+  height?: number;
+}
+const { scene, caption, height = 240 } = Astro.props;
+---
+
+<figure class="my-8 not-prose">
+  <div
+    class="relative overflow-hidden rounded-lg border border-ink-700 bg-ink-950"
+    style={`height:${height}px`}
+  >
+    <div class="grid-dots pointer-events-none absolute inset-0 opacity-30"></div>
+    <canvas
+      data-scene-figure={scene}
+      class="absolute inset-0 h-full w-full"
+      aria-hidden="true"></canvas>
+    <span
+      class="absolute right-2 top-2 font-mono text-[10px] uppercase tracking-wider text-slate-600"
+      >{scene}</span
+    >
+  </div>
+  {
+    caption && (
+      <figcaption class="mt-2 text-center font-mono text-xs text-slate-500">
+        {caption}
+      </figcaption>
+    )
+  }
+</figure>
+
+<script>
+  import { initFxScene } from "../scripts/fx";
+
+  // Boot every scene figure on the page with its named scene.
+  const canvases = document.querySelectorAll<HTMLCanvasElement>(
+    "canvas[data-scene-figure]",
+  );
+  for (const canvas of canvases) {
+    const scene = canvas.dataset.sceneFigure;
+    if (scene) initFxScene(canvas, scene);
+  }
+</script>

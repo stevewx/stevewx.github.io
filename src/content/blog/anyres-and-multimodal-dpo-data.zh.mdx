@@ -1,0 +1,120 @@
+---
+title: "AnyRes 与多模态 DPO 数据流水线"
+description: "视觉语言模型为什么要把高分辨率图像切成变长的 token 序列，以及这种变长会给一条为大规模 DPO 打造的偏好数据流水线带来哪些连锁影响。"
+date: 2024-10-28
+category: work
+author: Xuan Wang
+tags: ["anyres", "multimodal", "dpo", "data-pipeline", "vlm"]
+featured: false
+draft: false
+lang: "zh"
+references:
+  - title: "LLaVA-NeXT: Improved reasoning, OCR, and world knowledge"
+    url: "https://llava-vl.github.io/blog/2024-01-30-llava-next/"
+    note: "推广了 AnyRes 切片方法"
+  - authors: "Rafailov et al., 2023"
+    title: "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"
+    url: "https://arxiv.org/abs/2305.18290"
+    note: "DPO 目标函数及其 reference-policy 项"
+  - title: "WebDataset"
+    url: "https://github.com/webdataset/webdataset"
+    note: "面向高吞吐流式 dataloader 的 tar-shard 格式"
+---
+
+import AnyResDiagram from "../../components/AnyResDiagram.astro";
+
+把一张电子表格截图丢给一个典型的 2024 年前后的视觉语言模型（VLM），让它读出第 12 行、C 列的数值，它多半会一本正经地编一个出来。这不怪语言模型笨——问题在于，等像素传到它眼前时，那个单元格只剩三个像素宽，数字早没了。
+
+问题出在视觉编码器上。大多数 VLM 的做法是把一个冻结的 CLIP/ViT 编码器接到 LLM 上，而这个编码器是按固定输入尺寸训练的，通常是 336x336。于是不管来的是一张表情包还是一份密密麻麻的财报，编码前都会先缩放成那个小方块。自然场景下这没什么问题；可一旦碰上 OCR、图表、文档、密集的 UI 截图，以及任何细节藏在精细结构里的场景，被扔掉的恰恰是任务真正需要的信息。
+
+<AnyResDiagram caption="AnyRes 不动编码器，而是把图像更完整地喂进去：切成原生分辨率的图块，再配一张缩小的全局缩略图，各自独立编码——视觉 token 数量比单次朴素缩放多出许多，换来的是精细细节得以保留。" />
+
+## 固定分辨率的瓶颈
+
+想一想 patch size 为 14 的 336px ViT 到底产出什么：每边 $336/14 = 24$ 个 patch，合起来 $24 \times 24 = 576$ 个视觉 token——不管源图里有多少细节，都是这个数。假设文档原本 2000px 宽，缩放到 336px 之后，每个 ViT patch 大致对应原图上一块 $80 \times 80$ 的区域；这块区域里的精细细节，早在编码器看到之前就被重采样抹掉了。小号文字比一个 patch 还小，根本无从恢复。
+
+直接把编码器的输入分辨率调高也行不通。ViT self-attention 的开销随 patch 数量二次增长；positional embeddings 是在训练分辨率下学出来的，一旦插值到相差很远的分辨率就会退化；再加上编码器本身是在单一尺度上做对比预训练的，喂进去一个尺度差异极大的输入，特征就会漂到分布之外。而从头训练一个高分辨率编码器既烧钱，在 2024 年也不是大多数团队会选的起点。
+
+## AnyRes：按原生分辨率切片
+
+AnyRes（由 LLaVA-NeXT 带火）绕开了这些麻烦。它不再把整张图缩到编码器的原生尺寸，而是让编码器保持在原生分辨率不动，转而把图像更完整地喂进去：
+
+1. 从一个小的候选集合里，挑出最贴合图像宽高比的网格布局——比如 $2\times2$、$1\times3$、$3\times1$、$2\times3$ 这几种，每个图块正好是一次完整的编码器输入。
+2. 按这个网格把高分辨率图像切成一张张子图，每张都是编码器的原生分辨率（比如 336px），再逐块独立编码。
+3. 另外再对整张图的一张缩小版全局缩略图编码一次，让模型保留住粗粒度的布局和全局上下文。
+4. 最后把所有视觉 token——图块加缩略图——拼成一个序列，投影到 LLM 的 embedding 空间。
+
+这样一来，编码器始终看不到分布外的输入——每个图块都是一张正常的 336px 裁剪图。可模型感知到的有效分辨率却高了许多：那个当初只有三个像素的表格单元格，如今落在某一个图块里，独享完整的 576-token 预算。
+
+代价落在 token 数量上。设 $g$ 为图块总数，即 $g = \text{rows} \times \text{cols}$，那么上面那几种网格对应 $g \in \{3, 4, 6\}$；配置的网格选项越多，这个集合就越大。一个 $g$ 图块加一张缩略图的网格，配上每次编码器前向产出 $T$ 个 token，单张图像大约给出
+
+$$
+N_{\text{visual}} = (g + 1)\,T \quad\text{tokens.}
+$$
+
+$336$px 的图块对应 $T = 576$；实际配置里常常会对图块做 unpad（去掉为贴合网格宽高比而补进来的 padding token），有些还会丢掉一些 token 来卡住固定的视觉 token 预算——注意这不是为了删冗余内容。对后面的一切来说，最关键的一点是：**$N_{\text{visual}}$ 逐样本都不一样**；碰上一份密集文档，光是文本提示词还没拼上，它就可能冲到好几千个 token。一批图像，也就不再是一个形状规整、固定的张量了。
+
+```python
+# illustrative -- not a real implementation
+def anyres_tokens(image, encoder, grid_options):
+    grid = pick_best_grid(image.size, grid_options)   # e.g. (2, 3)
+    tiles = split_into_tiles(image, grid)             # each at 336x336
+    thumb = downsize(image, encoder.native_size)      # global context
+
+    tile_feats = [encoder(t) for t in tiles]          # each (576, d)
+    thumb_feat = encoder(thumb)                        # (576, d)
+
+    # variable-length: depends on the chosen grid
+    return concat(tile_feats + [thumb_feat])          # (N_visual, d)
+```
+
+## 麻烦为什么都堆在数据流水线上
+
+真正的回报在这里，真正吃工程时间的地方也在这里。AnyRes 在建模那一侧是个干净利落的主意，可它真正的代价，要等你想在一个 VLM 上大规模做偏好优化时才会显现。
+
+Direct Preference Optimization（DPO）在成对数据上训练：一个提示词 $x$、一个被选中的回复 $y_w$，还有一个被拒绝的回复 $y_l$。它以一个冻结的 reference policy $\pi_{\text{ref}}$ 为基准来优化 policy $\pi_\theta$，让被选中与被拒绝之间的隐式奖励间隔不断拉大：
+
+$$
+\mathcal{L}_{\text{DPO}} = -\,\mathbb{E}_{(x, y_w, y_l)} \left[ \log \sigma\!\left( \beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)} \right) \right].
+$$
+
+在纯文本 DPO 里，$x$ 无非是一段 token 序列。到了多模态 DPO，$x$ 里还含着一张图像——而这张图像经 AnyRes 一展开，就成了一大团变长的视觉 token，并且在被选中和被拒绝这两次前向里都得原样带着。于是三件在纯文本世界里轻轻松松的事，一下子都变棘手了。
+
+**1. 把视觉特征预计算并缓存下来。** 每个训练步都对每张图的每个图块重跑一遍视觉编码器，纯属浪费——编码器既然冻结了，输出就永远不变。所以 AnyRes 图块特征只算一次，按样本缓存起来。这套缓存只在编码器冻结时才成立；而且除非 projector 也冻结，否则该缓存的是原始编码器特征，而不是投影后的 token——解冻编码器会让这项优化彻底作废，可训练的 projector 也会让缓存下来的投影 token 变陈旧（stale）。不过因为 $N_{\text{visual}}$ 会变，缓存里存的是长短不齐的变长数组。你得把长度和特征一起存，dataloader 才能正确地打包、padding；缓存的键则用图像内容哈希加上网格配置，这样配置一改，缓存就能干净利落地失效。
+
+**2. 文本和多模态共用一套数据格式。** 一次偏好微调很少只喂图像，通常是纯文本对和多模态对混着来。要是文本样本和多模态样本各走各的代码路径，批处理和 loss masking 就会陷进一堆特例的泥潭。办法是统一成一套记录 schema：视觉 token 字段对纯文本样本留空，对多模态样本则是一个变长数组。每条记录都带着：提示词 token、被选中 token、被拒绝 token、一个可选的、附带长度的视觉特征块，以及 loss mask。两类样本走同一套 collation 逻辑。
+
+**3. 把 reference log-probs 预计算好。** $\pi_{\text{ref}}$ 是冻结的，所以 $\log \pi_{\text{ref}}(y_w \mid x)$ 和 $\log \pi_{\text{ref}}(y_l \mid x)$ 在训练里也从不变化。若是临时现算，就得常驻第二份完整的模型、每一步都跑它——对于一个每样本几千个视觉 token 的 VLM，这等于在每个训练步之外又压上一次完整前向（那份冻结的 reference 模型）。更好的办法是离线跑一遍：对每一对，用 reference policy 在 AnyRes 展开后的输入上算一次，把两个标量 reference log-prob 写进记录。这样训练时就只前向 $\pi_\theta$，DPO loss 直接读缓存好的 reference 标量。这个标量捷径对大多数序列级目标都管用——原版 DPO 和 IPO 都归约到同一个缓存下来的对数比。但它在真正的 *token 级* 目标（比如 TDPO）上会失效，那种情况要缓存的是逐 token 的 reference logprob，而非单个标量；长度归一化的变体则还得额外存下回复长度。（至于辅助的 SFT/NLL 项，又是另一码事——它算的是 *policy* 在被选中回复上的 logprob，压根不碰 reference 标量。）
+
+```python
+# illustrative -- not a real implementation
+def build_record(sample, encoder, ref_policy):
+    visual = anyres_tokens(sample.image, encoder, GRIDS) if sample.image else None
+    x = assemble_inputs(sample.prompt, visual)        # variable length
+
+    # reference log-probs are constant -> compute once, store scalars
+    ref_lp_w = ref_policy.logprob(sample.chosen, x)
+    ref_lp_l = ref_policy.logprob(sample.rejected, x)
+
+    return {
+        "prompt": tokenize(sample.prompt),
+        "chosen": tokenize(sample.chosen),
+        "rejected": tokenize(sample.rejected),
+        "visual": visual,                 # None for text-only
+        "visual_len": len(visual) if visual is not None else 0,
+        "ref_lp_chosen": ref_lp_w,
+        "ref_lp_rejected": ref_lp_l,
+    }
+```
+
+## 分片：别让 dataloader 拖后腿
+
+一旦每个样本都变成一条自包含的记录、还可能烘进了一大块视觉特征，记录就会很大，整个数据集根本塞不进内存。标准答案是 WebDataset：把记录序列化进分片的 `.tar` 文件，然后流式读取。每个 shard 从几百 MB 到一两 GB 不等，装着一段连续的记录，顺序读取——这恰好是对象存储和机械硬盘最擅长的活儿。
+
+讲究的地方在 data parallelism 下怎么给 shard 打包。有 $D$ 个 data-parallel rank 时，你希望每个 rank 分到一组互不重叠的 shard，且各自的总 token 量大致相当——注意是 token 量相当，不是样本数相当。因为 AnyRes 把 $N_{\text{visual}}$ 变成了变量，一个塞满密集文档的 shard 携带的 token，远远多于一个装纯文本对的 shard。要是图省事、按样本数打包再 round-robin 分下去，就会出现某个 rank 一直在啃文档密集的 shard、其余 rank 却在干等的局面，而最慢的那个 rank 会拖住每一步。所以正确做法是：先估好每条记录的 token 成本，按总 token 数贪心地把各 shard 平衡开，再把 shard 数量对齐到 $D$ 的整数倍，分配才干净，每个 rank 拿到的工作量也相当。做到这些，流式 dataloader 就能始终跑在 GPU 前头，而不会沦为让一切都堵在它跟前的那堵墙。
+
+## 说到底
+
+AnyRes 是对一个真实局限的务实回应：冻结的、固定分辨率的编码器看不清精细细节，那就按编码器的原生分辨率切片、再补一张全局缩略图，用一个可变而且往往不小的视觉 token 数量，换回真正读得清的细节。而正是这一个设计选择——变长视觉 token——把整条多模态 DPO 流水线重新塑了形：预计算并缓存长短不齐的 AnyRes 特征，用一套记录 schema 统一文本和多模态，预计算冻结的 reference log-probs，再按 token 平衡地切成对齐 data-parallel 布局的 WebDataset tar。这些活儿没一件光鲜，可它决定了你的 trainer 到底是卡在 GPU 上，还是在挨饿等 I/O。
+
+也得老实标一下时间：AnyRes 代表的是 2024 年末前后多模态实践的水平。此后原生高分辨率、动态分辨率的编码器逐渐成熟，把其中一部分工作重新收回到了模型内部，切片那套花活儿也随之收缩——但关于变长特征、reference-logprob 缓存和 token 平衡 sharding 的这些数据流水线经验，不管像素最终怎么编码，都照样用得上。

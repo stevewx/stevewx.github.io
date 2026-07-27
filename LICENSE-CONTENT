@@ -1,0 +1,22 @@
+Content License — All Rights Reserved
+
+Copyright (c) 2026 Xuan Wang (王烜). All rights reserved.
+
+This license applies to the SITE CONTENT, as distinct from the site source
+code (which is licensed under the MIT License; see LICENSE). Content includes:
+
+  - all blog posts and writeups, in any language, under `src/content/`;
+  - the personal and biographical text (bio, role history, education, and
+    similar prose) in `src/i18n/` and `src/consts.ts`;
+  - the author's name, likeness, and personal information.
+
+You may read this content here and share links to the original pages. You may
+NOT copy, reproduce, republish, translate, adapt, or redistribute the content,
+in whole or in part, in any medium, without prior written permission from the
+copyright holder.
+
+Quoting brief excerpts for commentary, review, or reference, with attribution
+and a link back to the original, is permitted.
+
+The reusable site machinery remains free to use under the MIT License — only
+the authored content above is reserved.

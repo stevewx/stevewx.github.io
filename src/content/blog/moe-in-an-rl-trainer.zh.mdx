@@ -1,0 +1,133 @@
+---
+title: "把 MoE 塞进 RL Trainer：稀疏性会在哪些地方反噬"
+description: "稀疏的 Mixture-of-Experts 模型，总参数量巨大，激活参数量却不多。可一旦把它塞进 PPO 系列的后训练流水线，那个让预训练变便宜的稀疏性，就会在内存、rollout、路由，还有你对 LoRA 的种种假设上接连反噬。"
+date: 2024-07-22
+category: work
+author: Xuan Wang
+tags: ["moe","expert-parallelism","ppo","routing","training"]
+featured: false
+draft: false
+lang: "zh"
+references:
+  - authors: "Fedus et al., 2021"
+    title: "Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity"
+    url: "https://arxiv.org/abs/2101.03961"
+    note: "top-1 路由与负载均衡辅助损失"
+  - authors: "Jiang et al., 2024"
+    title: "Mixtral of Experts"
+    url: "https://arxiv.org/abs/2401.04088"
+    note: "top-2 路由；13B 激活 / 47B 总量"
+  - authors: "Lepikhin et al., 2020"
+    title: "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding"
+    url: "https://arxiv.org/abs/2006.16668"
+    note: "expert parallelism 以及 all-to-all 的 dispatch/combine"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+Mixture-of-Experts 是个挺反直觉的东西：参数量能有数千亿，可每个 token 消耗的 FLOPs，却和一个只有它零头大小的模型差不多。正是这笔划算的买卖，让 MoE 在预训练里遍地开花。但 RL 后训练流水线——PPO、GRPO、RLOO 这一票 policy-gradient 方法——当初基本是照着 *dense* 模型设计的；那个让预训练变便宜的稀疏性，会一口气悄悄踩坏它好几条前提假设。这篇文章先带你从 dense FFN 走到它的稀疏替身，再看看把它接进 RL trainer 之后，稀疏性具体会在哪四个地方反噬。
+
+<SceneFigure
+  scene="moe-routing"
+  height={160}
+  caption="一个 token 进入 MoE 层，router 为各个 expert 打分，只有 top-k 被点亮。对任何一个 token 来说，绝大多数 expert 都是暗的——这就是稀疏性，也是下游一连串麻烦的根源。"
+/>
+
+## 从单个 dense FFN，到一堆稀疏 expert
+
+标准 transformer block 里，每个 token 都要过一个 feed-forward 网络——一个所有 token 共用的大矩阵乘法。稀疏 MoE 层做的事，就是把这一个 FFN 换成 $N$ 个并行的 **expert** FFN，外加一个小小的、可学习的 **router**。router 给每个 token 的各个 expert 打分，再把这个 token 只发给分数最高的 top-$k$ 个（常见的是 Switch Transformer 那样取 $k=1$，或者 Mixtral 8x7B 那样取 $k=2$）。
+
+具体点说，给定一个 token 的隐藏状态 $x$，router 先算出 gate logits，在选中的那几个 expert 上做 softmax，再把它们的输出加权合起来：
+
+$$
+g(x) = \mathrm{softmax}\big(\mathrm{TopK}(W_r\, x,\; k)\big),
+\qquad
+y = \sum_{i \in \mathrm{TopK}} g_i(x)\, E_i(x)
+$$
+
+上面这个写法是 Mixtral 一派的约定——先挑出 top-$k$ 的 logits，再只在这几个上面做 softmax。别的设计不一样：Switch Transformer 是先在全部 $N$ 个 expert 上做 softmax，再取 top-1。真正的重点在接下来这笔账。**总**参数量随 $N$ 走——每个 expert 都是一整个 FFN，实打实占着内存。而每个 token 的**激活**参数量随 $k$ 走。$N=8$ 个 expert、$k=2$ 时，你存着八个 FFN，每个 token 却只算其中两个：
+
+$$
+P_{\text{total}} \sim N \cdot P_{\text{expert}},
+\qquad
+P_{\text{active}} \sim k \cdot P_{\text{expert}},
+\qquad
+\frac{P_{\text{active}}}{P_{\text{total}}} \approx \frac{k}{N}
+$$
+
+只数 expert FFN 的话，这个比值就是 $k/N$；要是算上整个模型，激活比例会再高一点，因为 attention、router、embedding，还有那些共享的常开 expert，对每个 token 都是激活的——而且除了那个很小的 $d \times N$ router gate，它们也不随 $N$ 变大（所以 Mixtral 实际大约落在 13B 激活 / 47B 总量，并不恰好等于 $2/8$）。不管怎么算，结论都一样：总参数量爆炸，每个 token 的 FLOPs 却始终不高。这种解耦，在预训练里是白赚的红利——可这笔账，到了下游要处处还回来。
+
+## 第一处失守：内存，以及 expert parallelism 为何是刚需
+
+最先绷不住的，是最基本的一件事：**把模型装下**。
+
+每个 token 的计算量是小，可*权重*一点都不小。哪怕某个 expert 极少被触发，它也得老老实实待在 GPU 内存里。朴素的 data-parallel 方案会把整个模型在每张 GPU 上复制一份——对大型 MoE 来说，这意味着每张 GPU 都得装下每一层的全部 $N$ 个 expert。总参数量上到数千亿，这种做法立刻 OOM。
+
+标准解法是 **expert parallelism（EP）**：把一层里的 expert *打散*到多张 GPU 上，每张设备只拥有其中 $N / \text{EP}$ 个，谁也不持有完整的一套 expert。代价是路由从此要跨设备。GPU 0 上某个 token 的 top-$k$ 里若挑中了 GPU 3 上的 expert，就得把它*送过去*算完，再把结果送回来。这就是一次 **all-to-all** 集合通信，每个 MoE 层要来两回（dispatch 和 combine）：
+
+$$
+\text{tokens} \xrightarrow[\text{dispatch}]{\text{all-to-all}}
+\text{experts on remote GPUs}
+\xrightarrow[\text{combine}]{\text{all-to-all}}
+\text{tokens}
+$$
+
+这类通信在 dense 模型里压根不存在。而在 RL trainer 里，它可能出现*两次*：一次在你正训练的策略网络里，另一次在生成轨迹的 rollout 引擎里——*前提是*它也把 expert 跨 GPU 分片（它也可能改用 tensor parallelism，或者根本不靠 expert parallelism 就把 expert 塞下）——这正好引出下一个问题。
+
+## 第二处失守：rollout 引擎也得懂 MoE
+
+RL 后训练有一个生成阶段：当前策略自回归地吐出补全，这些补全被打分，再变成梯度信号。这一步生成几乎总是跑在专门的推理引擎上（vLLM、SGLang），*而不是*训练框架里。
+
+换成 dense 模型，引擎只要把架构跑得够快就行。可换成 MoE，它必须实现**一模一样的路由语义，而且 expert 布局要从 trainer 那边正确映射过来**——物理分片可以不一样（EP degree 不同，或者干脆改用 tensor parallelism），但逻辑上的 expert 编号必须在权重转换时对上，否则引擎跑的就是一个悄悄跑偏的模型。有两条要求，在 dense 模型上无足轻重，到这里却成了承重墙：
+
+- 推理引擎得有一条 MoE-aware 的 kernel 路径：top-$k$ 路由、expert dispatch，以及——如果它也把 expert 跨推理 GPU 分片——属于它自己的一套 all-to-all。
+- **训练侧和推理侧的 expert 布局必须对齐**，checkpoint 转换才不会出错。
+
+最后这一条，是那种经典的隐蔽 bug 温床。要是 trainer 按一种方式给 expert 编号、分片，推理引擎却按另一种，权重同步就会不声不响地把 expert $i$ 的参数塞进 expert $j$ 的槽位。程序不会崩——router 照样路由，FFN 照样做乘法——但你拿来生成的策略，已经不是你训练出来的那个了。差一位的 expert 排列，shape 检查根本看不出来，对训练却是致命的。
+
+```python
+# illustrative — not a real implementation
+# sync trained weights into the rollout engine, expert-aware
+for layer in policy.moe_layers:
+    for i, expert in enumerate(layer.experts):
+        global_id = layer.local_to_global_expert_id(i)   # MUST match engine's map
+        engine.load_expert(layer.idx, global_id, expert.state_dict())
+# a wrong local_to_global map = correct shapes, wrong policy, broken RL
+```
+
+## 第三处失守：偏离分布的 RL 数据会让路由漂移
+
+MoE 训练靠一个**负载均衡辅助损失**，防止 router 塌缩到少数几个偏爱的 expert 上。常见写法是惩罚两个量的乘积：一个是路由到每个 expert 的 token 占比，另一个是 router 分给它的平均概率质量：
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha \cdot N \sum_{i=1}^{N} f_i \cdot p_i
+$$
+
+其中 $f_i$ 是被 dispatch 到 expert $i$ 的 token 占比，$p_i$ 是分给它的平均 gate 概率。写成乘积是有意为之：$f_i$ 是硬计数、不可微，所以梯度只从软的 $p_i$ 那一侧流过去，$f_i$ 相当于一个被 detach 的权重。把它压到最小，就会把 router 推向大致均匀的利用率，没有哪个 expert 过载，也没有哪个饿着。而这套东西，是在预训练期间、照着预训练分布调出来的。
+
+可 RL 后训练喂进去的根本不是那个分布。数据是**自己生成**的：从当前策略采样出补全，再用 reward 过滤或加权。reward 盯着的是一小片很窄的行为——某种格式、某种 tool-call 风格、某个领域——token 分布也跟着它跑偏。于是有两种翻车方式。一是 router 漂移，策略的新行为挤到少数几个 expert 上，剩下的容量全闲着。二是你把 aux loss 压得很硬，它就会跟 reward 信号顶牛——硬逼出一种数据早就不想要的均衡，反倒把你正想塑造的那个行为给磨钝了。冲着 reward 目标去调 $\alpha$，是 dense RL 时代根本不用碰的一个旋钮。
+
+## 第四处失守：只给 attention 做 LoRA，对 MoE 会欠拟合
+
+参数高效微调在 RL 里很有吸引力——给一个巨型策略做全量 fine-tuning 太贵，而在 attention projection 上挂 LoRA，是从 dense 模型那儿沿袭下来的下意识默认。放到 MoE 上，这个默认会悄悄欠拟合，道理不过就是文章开头那笔参数账。
+
+在 dense transformer 里，attention 和 FFN 还在同一个数量级——FFN 那块更大，但没大到碾压的地步——所以只调 attention 的 LoRA，多少还是碰到了有分量的一部分。可在 MoE 里，**参数的绝大部分都攥在 expert 手里**——模型基本就是 FFN，复制了 $N$ 份。router 决定*哪种*行为被触发，而 expert *本身就是*那个行为。把每个 expert 都冻住、只调 attention，你不过是在给一个冻住的核心重塑一层薄壳：
+
+$$
+P_{\text{attn}} \ll P_{\text{experts}}
+\quad\Longrightarrow\quad
+\text{attention-only LoRA leaves most capacity untouched}
+$$
+
+如果 RL 要把策略的行为挪动的幅度不止一星半点，adapter 就得够到 expert，最好连 router 一起够到——比如 expert LoRA，或者有选择地解冻一部分 expert——而不是停在 attention projection 上。dense 时代那句“attention 上挂个 LoRA 通常就够了”，搬不过来。
+
+## 所以呢
+
+在 RL trainer 里，MoE 不是 dense 策略那种插上就能用的替代品。让它高效的那一个属性——总参数量巨大、激活参数量稀疏——会一路传导到四个不同的地方：
+
+- **内存：** expert 没法靠复制装下；**expert parallelism** 是刚需，它还额外背上了 dense 模型从不用付的 all-to-all 路由通信。
+- **Rollout：** 推理引擎也得实现 MoE 路由，而且它的 expert 布局映射必须和 trainer 对齐，否则 checkpoint 转换会不声不响地把策略搞坏。
+- **路由：** 负载均衡的 aux loss 是照着预训练分布调的；偏离分布的 RL 数据会把路由带偏，而 aux loss 又可能跟 reward 信号顶牛。
+- **PEFT：** 只调 attention 的 LoRA 会欠拟合，因为容量——还有 RL 想塑造的那个行为——都住在 expert 里。
+
+贯穿始终的一条线是：别再把 MoE 当成一个模型，而要把它看成 $N$ 个 expert 加一个 router——这一套既要在训练和推理之间保持一致，又要跟一个正拼命想打破均衡的 reward 信号较劲。expert 这本账记对了，稀疏性依旧是份红利；记错了，故障会静悄悄地发生，而这恰恰是最糟的那一种。

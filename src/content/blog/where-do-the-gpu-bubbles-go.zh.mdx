@@ -1,0 +1,153 @@
+---
+title: "GPU 的空闲时间都去哪了？"
+description: "同步式 RL post-training 里，GPU 只能干等最慢的那条 rollout 跑完。interleaving、pipelining、full async 逐级把这些 bubble 压下去——本质上是拿策略新鲜度换吞吐。本文沿着两条正交的轴，把这件事讲清楚。"
+date: 2025-12-15
+category: work
+author: Xuan Wang
+tags: ["async-rl", "partial-rollout", "ppo", "throughput", "verl"]
+featured: true
+draft: false
+lang: "zh"
+references:
+  - authors: "Yu et al., 2025"
+    title: "DAPO: An Open-Source LLM Reinforcement Learning System at Scale"
+    url: "https://arxiv.org/abs/2503.14476"
+    note: "面向大规模 RL 的解耦 clip + 动态采样"
+  - title: "verl — Volcano Engine Reinforcement Learning for LLMs"
+    url: "https://github.com/volcengine/verl"
+    note: "支持 async/partial-rollout 的开源 RL post-training 框架"
+  - title: "slime — an SGLang-native post-training framework"
+    url: "https://github.com/THUDM/slime"
+    note: "支持 colocated 与 disaggregated 执行的 RL 扩展"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+给一次同步式 RL post-training 做一遍 profiling，最先让人意外的往往是：GPU 真正花在训练上的时间少得可怜，绝大多数时候都在空等。这篇文章想讲清楚两件事——这些被白白浪费的时间到底从哪来，以及有哪一套调度手段能把它们一点点抢回来：**interleaving**、**pipelining** 和 **full async**；再加上一个与之正交的问题——rollout 和训练在物理上究竟跑在哪。
+
+这两件事很容易被混在一起，所以我把它们拆成两条独立的轴来看：
+
+- **策略新鲜度（policy freshness）**——trainer 拿去学习的数据有多"旧"？这就是那道阶梯：synchronous → interleaved → pipelined → fully async。
+- **放置（placement）**——rollout 和训练是共用同一批 GPU（colocated），还是各自跑在独立的机群上（separate-stage）？
+
+下面这段动画演示的就是这道新鲜度阶梯。我们先一级一级走完，再回过头来聊 placement。
+
+<SceneFigure
+  scene="pipeline"
+  height={160}
+  caption="新鲜度阶梯。橙色 = rollout/生成，青色 = 训练，斜纹 = GPU 空闲，Δθ 表示一次权重更新。注意看这些 bubble 如何一点点缩小——而 staleness 随之抬头。"
+/>
+
+## RL post-training 的循环，以及躲不开的 bubble
+
+policy-gradient 一类的 RL post-training（PPO、GRPO、RLOO、DAPO——这个家族很庞大，但循环都是同一个），一步可以拆成三个阶段：
+
+1. **Rollout / 生成**——当前策略为一批 prompts 生成 completions。自回归解码，通常跑在 vLLM 或 SGLang 上。
+2. **奖励 / 打分**——用 reward model、verifier 或规则给这些结果打分。
+3. **训练**——算出 advantages，对策略走一步梯度更新。
+
+在**完全同步**的做法里，这三步严格按顺序来，第 1 步不彻底跑完，第 3 步就动不了。问题恰恰出在生成长度的分布上。
+
+生成耗时是被**这一批里最长的那条序列**拖住的。解码是自回归的，一条要写到 4,000 tokens 的 completion，耗时差不多是停在 500 tokens 那条的 8 倍——偏偏这俩还在*同一批*里。于是 trainer 只能干等，一直等到最慢的那条把最后一个 token 吐出来。
+
+$$
+T_{\text{rollout}} \;\approx\; \max_{i \in \text{batch}} \, t_i
+\qquad\text{not}\qquad
+\frac{1}{N}\sum_{i} t_i
+$$
+
+这段空档——trainer 的 GPU 上着电、占着坑，却什么活都不干——就是所谓的 **bubble**。在长上下文、长度方差又大的 RL 里，bubble 可能吃掉大半的墙钟时间。好的一面是，此时数据是最新鲜的：每一个样本都恰好由你马上要更新的那个策略产出，**staleness 为零**。而本文接下来要做的，就是拿这份新鲜度里的一部分去换吞吐。
+
+## 第一级：interleaved rollout（依然 on-policy）
+
+这第一级乍看会引入 staleness——但其实并不会，而搞清楚*为什么*不会，才是重点。
+
+把 global batch 切成若干 **mini-batch**。接下来，让靠后的 mini-batch 做*生成*的同时，靠前的 mini-batch 已经在做*训练*（前向/反向 + 梯度累积）。两条泳道并发跑起来，bubble 就缩小了。
+
+关键在于：**optimizer step——也就是真正的权重更新——要等到 global batch 里*所有* mini-batch 都训练完才触发。**在这道屏障之前，策略权重一动不动。所以这一批里的每个 mini-batch，不管是最先还是最后生成的，用的都是*同一个*策略版本。
+
+$$
+\theta \leftarrow \theta - \eta \nabla_\theta \mathcal{L}
+\qquad\text{once per global batch, after all mini-batches}
+$$
+
+这就是为什么 interleaved rollout **仍然是 on-policy，staleness 为 0**。在动画里，它对应带虚线 **Δθ** 标记的那一段——只有这些点才发生权重更新。两条 Δθ 线之间的一切，都出自同一个被冻结的策略。你只是把工作重叠了起来，更新的数学一点没变。
+
+这是所有吞吐优化里最稳妥的一种——不动算法，也没有 staleness 要操心——但它有上限：gen 和 train 终究都得在屏障前收尾，所以一旦生成比训练慢很多（长上下文 RL 里通常就是这样），trainer 照样得等。
+
+## 第二级：pipelined async（off-policy 一步）
+
+想重叠得*更多*，就干脆撤掉每一批的那道屏障，让两条时间线错开一步：trainer 在做第 $k$ 步的时候，rollout 引擎已经在生成第 $k{+}1$ 步要用的那一批了。
+
+```python
+# illustrative one-step pipeline
+prev = rollout.generate(policy)            # warm up: batch for step 0
+for k in range(max_steps):
+    next_future = rollout.generate_async(policy)  # gen batch k+1 ...
+    trainer.step(prev)                            # ... while training on batch k
+    policy = trainer.weights
+    prev = next_future.result()
+```
+
+现在两条泳道稳稳地重叠上了——但要注意，第 $k{+}1$ 批是用第 $k$ 步更新*之前*的策略生成的。这份数据正好**off-policy 一步**，是一份小而固定的 staleness，通常无伤大雅，有时甚至还带点轻微的正则化效果。利用率再往上走一截；bubble 基本不见了。
+
+## 第三级：fully async（有界的 staleness）
+
+最高这一级把锁步彻底拿掉。生成器**不停地**跑，从不为某一个训练步停下来；trainer 也在自己空出手的时候，把手头已经就绪的 completions 拿去用。两条泳道谁也不卡谁，于是利用率逼近 100%——动画里两条泳道都被填得满满当当。
+
+代价是：一条轨迹可能由第 $k$ 步的策略生成，却拖到第 $k{+}3$ 步才被用上。数据现在是**off-policy 好几步**，而不设上限的 staleness 会把训练搞崩。所以真正的工程功夫，全在于*给它设个界*：
+
+$$
+\text{staleness}(i) \;=\; k_{\text{train}} - k_{\text{gen}}(i) \;\le\; s_{\max}
+$$
+
+再用 PPO 本来就在用的那套 per-token importance-sampling 比率去修正策略漂移，逐个 token 地施加并做 clip，让 surrogate 把这次 off-policy 更新拽住：
+
+$$
+r_t(\theta) \;=\; \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{gen}}}(a_t \mid s_t)}
+$$
+
+$s_{\max}$ 卡得太紧，你就又退回到干等的老路；放得太松，就是拿吞吐去换不稳定。而找到那个拐点——针对具体的模型规模、上下文长度和奖励地形——才是真正花力气的地方。
+
+## 另一条轴：这些活到底跑在哪？
+
+上面讲的全是*新鲜度*这条轴。跟它正交的是 **placement**——rollout 和训练实际用的到底是哪些 GPU？这里有个细节最容易把人绕进去，所以干脆把话挑明了说。
+
+- **Colocated（hybrid engine）：** trainer 和 rollout 共用同一批 GPU，靠时间分片轮着用。省显存，但两个阶段没法真的在同一时刻、同一块设备上一起跑。
+- **Separate-stage：** rollout 跑在一个机群上，训练跑在另一个机群上。两者可以货真价实地并发，代价是要同时留着两份模型，还得在机群之间搬运权重。
+
+这两条轴之间的搭配关系，值得记下来：
+
+| 新鲜度模式 | Colocated hybrid engine | Separate-stage |
+| --- | :---: | :---: |
+| Fully synchronous | ✅ | ✅ |
+| Interleaved | — | ✅ |
+| Pipelined | — | ✅ |
+| Fully async | ✅ *(靠 partial rollout)* | ✅ |
+
+**Interleaved 和 pipelined 只能走 separate-stage。**这两者都指望 gen 和 train *并发*跑——可在 colocated 的 GPU 上，trainer 和 rollout 引擎共用同一批设备，你根本做不到。对共享 GPU 做时间分片也救不回来：要么把两段分片一前一后地跑，那就没有重叠可言（这不就是 synchronous 嘛）；要么暂停生成、等训练步跑完再恢复——可被恢复的那些轨迹这会儿已经出自一个陈旧的策略了（这就成了 async，带着 staleness）。说白了，一旦共享设备，你要么丢掉重叠，要么丢掉 on-policy 这个性质——所以真正的 interleaving 必须让 gen 和 train 分开在两套机群上跑。
+
+**Fully async 两条路都能到**，而 colocated 那条才是有意思的。在共享 GPU 上，你没法让生成一直跑下去——trainer 要用的正是这同一批设备。于是就有了 **partial rollout**：到了该训练的时候，把正在进行中的生成*暂停*下来（把它们的 KV 状态 checkpoint 存好），把 GPU 腾给 trainer 走一步，再把那些被暂停的轨迹从断点处*接着*往下跑。
+
+```python
+# illustrative colocated async via partial rollout
+inflight = engine.submit(oversampled_prompts())
+for step in range(max_steps):
+    done, inflight = engine.harvest(target=batch_size)  # fastest-first
+    paused = engine.pause(inflight)        # checkpoint KV of the long tail
+    trainer.step(assemble(done))           # GPUs now free for training
+    engine.resume(paused)                  # continue where they left off
+```
+
+partial rollout 本身并不算一种新鲜度模式——它只是那个*机制*：靠着不让任何一条长尾轨迹霸占住共享 GPU，让 fully-async 训练**在 colocated 硬件上**也跑得起来。（separate-stage 机群本来就各跑各的，async 是天生的，用不着 partial rollout 去给 trainer 腾 GPU——不过为了给 staleness 设界，它们可能照样会打断那些长尾生成。）
+
+## 那么，这些 bubble 究竟去哪了？
+
+它们哪儿都没*去*——是你不再制造它们了，一级一级地：
+
+- **Interleaved** 把 mini-batch 的 gen 和 train 重叠起来，同时把权重更新死死压在 global batch 屏障上——**on-policy，零 staleness。**
+- **Pipelined** 把两条时间线错开一步——**off-policy 一步。**
+- **Fully async** 把两条泳道彻底解绑——**有界的 staleness**，代价是一个携带上限（carry cap）加 importance weighting。
+- **Placement** 决定你*怎么*走到那一步：separate-stage 机群天生就是并发的；colocated hybrid engine 则靠 **partial rollout** 抵达 full async。
+
+顺着这道阶梯往上爬，开篇那段动画里表示空闲的斜纹，就会从"占了半条时间线"一路塌缩到"几乎看不见"——还是那些硬件，却干出了多得多的有用功——前提是，你得把自己揽下的那份 staleness 一直摁住。

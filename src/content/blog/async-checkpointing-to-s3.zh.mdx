@@ -1,0 +1,138 @@
+---
+title: "把 Checkpoint 异步分片上传到对象存储"
+description: "大规模训练里，失败是常态而非意外。本文讲的正是让失败可承受的那套机制：把状态按 rank 分片、暂存到本地 NVMe、在后台上传到对象存储，再确定性地恢复。"
+date: 2025-05-20
+category: work
+author: Xuan Wang
+tags: ["checkpointing", "s3", "reliability", "distributed-training", "fault-tolerance"]
+featured: false
+draft: false
+references:
+  - title: "PyTorch Distributed Checkpoint (DCP)"
+    url: "https://docs.pytorch.org/docs/stable/distributed.checkpoint.html"
+    note: "分片、可 reshard 的保存/加载"
+  - authors: "Rajbhandari et al., 2020"
+    title: "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models"
+    url: "https://arxiv.org/abs/1910.02054"
+    note: "本文方案所依托的分布式优化器状态 sharding"
+lang: "zh"
+---
+
+import SceneFigure from "../../components/SceneFigure.astro";
+
+一个大规模分布式训练任务只要跑得够久，问题就不再是它*会不会*崩，而是*多久崩一次*、*每次又要损失多少*。某个 rank 上的 CUDA out-of-memory、一次挂到看门狗超时才被发现的 NCCL 集合通信、一个从网络 fabric 上掉线的节点、一个 step 跑到一半就被回收的 spot 实例——在几百上千张加速卡的规模下，这些根本算不上罕见，它们就是家常便饭。如果说这些故障是天气，那 checkpoint 就是那把伞；只可惜，最朴素的那把伞是漏的：*同步*地把好几 TB 的状态写往远端存储，会在数据刷完之前让整个任务里的每张 GPU 都停在那儿干等。
+
+这篇文章要讲的，就是怎么把这个洞补上——让 checkpoint 做得够勤，把损失控制住；做得够省，勤做也不心疼；做得够全，恢复时能真正复现整段训练。
+
+<SceneFigure
+  scene="checkpointing"
+  height={160}
+  caption="大规模训练的「故障天气」：OOM、NCCL 超时、节点掉线、被抢占。有了 checkpoint，每个红色事件才能从「前功尽弃」变成「只丢几分钟」。"
+/>
+
+## 同步 checkpoint 为什么是纯粹的 GPU 空转
+
+现代训练的 checkpoint 一点都不小。对于一个用了 ZeRO 式分布式优化器的大模型，需要持久化的状态大致是
+
+$$
+S \;=\; \underbrace{2P}_{\text{bf16 weights}} \;+\; \underbrace{4P}_{\text{fp32 master}} \;+\; \underbrace{8P}_{\text{Adam } m,\,v} \;\approx\; 14P \text{ bytes}
+$$
+
+$P$ 是参数量。这里算的是*要写进 checkpoint 的*那部分状态——梯度是瞬时的，按设计就不保存，所以常数是 $14$ 而不是大家更熟悉的 $16$ 字节/参数；同时这里假设 Adam 的一阶、二阶矩用 fp32（换成 bf16 master 权重或 8-bit 优化器状态，这个常数还会变）。一个几百亿参数的模型，*每个 checkpoint* 就在 1 TB 上下；到了几千亿参数，量级直接进到好几 TB。现在设想你按最直觉的做法来：在 step $k$，每个 rank 都停下来、把自己的状态序列化、写进对象存储，写完了才允许有人迈向 step $k{+}1$。这道屏障的墙钟开销是
+
+$$
+T_{\text{stall}} \;\approx\; \frac{S}{B_{\text{remote}}}
+$$
+
+其中 $B_{\text{remote}}$ 是你写到对象存储的有效吞吐。跟本地磁盘比，远端存储带宽有限、还容易被延迟拖后腿，所以这一项很大——动辄几十秒到几分钟——而这段时间里，*任务里的每张加速卡都在空转*。这就是纯粹的空转，而且你 checkpoint 越勤，它就被放大得越多。这里的矛盾非常尖锐：故障逼着你*更勤*地 checkpoint（好让每次崩溃少丢点活儿），可同步写又让每个 checkpoint *更贵*。到头来你只能少做 checkpoint，于是每次崩溃都要付出大量重算。
+
+解法是两条战线一起打：让每个 rank 少写一点（sharding），同时把慢吞吞的远端写*挪出*关键路径（本地暂存加异步上传）。
+
+## 把 checkpoint 拆到各个 rank 上
+
+在一个 3D 并行的任务里，模型状态本来就已经沿着 mesh 切开了——data-parallel 的副本、tensor-parallel 的分片、pipeline 的各个阶段。常见的错误是把它们全*聚合*回 rank 0，再写成一个巨大的单文件。这样一来，整个任务都被挤过同一个写入者、同一条网络链路，彻底串行化了。
+
+正确的做法是：**每个 rank 并行地各写各的那片状态**。在 ZeRO 式分布式优化器下，优化器状态沿 data-parallel 组分片，tensor 和 pipeline parallelism 则把权重分片。于是总的写吞吐变成了各 rank 各自链路带宽之*和*，而不再是单个 rank 那一条链路：
+
+$$
+T_{\text{write}} \;\approx\; \frac{S}{\sum_r B_r} \;=\; \frac{S / N}{\bar{B}}
+$$
+
+$N$ 是写入者的数量。不过这种「链路带宽相加」的加速，只在总量还没顶到后端上限之前有效——$\sum_r B_r \le B_{\text{backend}}$，也就是对象存储、或者跨 rank 网络与 NIC 出口带宽，往往远在 $N\,\bar{B}$ 之前就先饱和了。所以 sharding 能把暂存、序列化、上传这些环节并行铺开，却不会凭空给你比后端更多的总出口带宽；过了那个点，远端写就被 $B_{\text{backend}}$ 卡住——这也正是你想把它踢出关键路径的原因。每个 rank 写出自己的 shard，再附上一小段元数据，记录这个 shard 覆盖了哪些全局张量范围。另有一个独立的索引文件，把这些 shard 重新拼回成一个逻辑上的 checkpoint。这正是 PyTorch Distributed Checkpoint (DCP) 的思路：磁盘上的布局就是一堆按 rank 分的 shard 文件，外加一个 `.metadata` 索引；而且关键在于——它是*支持 resharding 的*。你可以在一种并行布局下保存，再换一种布局加载，因为索引记的是全局张量坐标，而不是「rank 3 上回碰巧拿到的那一块」。
+
+## 本地暂存，异步上传
+
+Sharding 把每次写入变小了，可字节终究还是得送到对象存储，而这条路很慢。于是把 checkpoint 拆成几个跑在不同时间线上的阶段：
+
+1. **快照到主机内存（快，在关键路径上）。** 训练循环唯一必须停下来等的，只有从 GPU→主机、拷进 pinned memory 这一步——一次 D2H memcpy，把张量拍个快照，好让训练接着往下改它们。每个 rank 只快照自己驻留的那片 shard，所以这次拷贝基本上就是关键路径上的全部开销。
+2. **落盘并上传（慢，在关键路径之外）。** 快照一进主机内存，后台 worker 就接手：序列化、落盘到本地 NVMe，再*一边训练照常跑、一边*把暂存好的 shard 流式传到 S3。这时 GPU 早已回去算 step $k{+}1$ 了，无论是主机→NVMe 的落盘，还是 NVMe→S3 的上传，都不在循环的关键路径上。
+
+重叠就是整件事的关键。只要 checkpoint $k$ 的上传能在你打算做 checkpoint $k{+}1$ 之前跑完，那慢速的远端写实际上就是白送的——它整个藏在计算底下，就像预取把 IO 藏在一个训练 step 底下一样。
+
+```python
+# illustrative — not a real implementation
+def checkpoint(step, model, optimizer, rng, dataloader):
+    # Phase 1: on the critical path, but fast — GPU -> pinned host memory (D2H copy).
+    shard = {
+        "model": model.local_shard_state(),        # this rank's slice only
+        "optim": optimizer.local_shard_state(),     # ZeRO-sharded m, v, master
+        "rng": rng.get_state(),                     # see below — load-bearing
+        "step": step,
+        "data_cursor": dataloader.cursor(),
+    }
+    snapshot = copy_to_pinned_host(shard)                # blocks briefly: D2H only
+
+    # Phase 2: hand off to the background worker and RETURN immediately.
+    #          serialize + spill to NVMe + upload all run off the critical path.
+    uploader.submit(snapshot, remote=f"s3://ckpts/step-{step}/shard-{RANK}")
+    # training loop resumes here; spill and upload run concurrently
+```
+
+后台上传器必须守住一条正确性规则：在**每一个** rank 的 shard 连同索引都完整落进对象存储之前，这个 checkpoint 都不算「完成」。用一个标记来对外宣告完整：先把所有 shard 和索引写好，最后再写一个小小的 `_COMPLETE` 对象。这个最后落笔的标记之所以靠得住，是因为对象存储没有原子的多对象重命名——所谓给前缀「改名」，本质是一次非原子的先复制、后删除，所以你没法像在 POSIX 文件系统上那样，靠一次重命名就把整个 checkpoint 原地切上线。（现代 S3 有强读后写一致性，标记落地之后再去读它是安全的；真正缺的原语是跨多个对象的原子性，而不是一致性。）一个只上传了一半的 checkpoint 决不能看上去像是能加载的，否则你这道可靠性护栏，反而成了静默加载损坏状态的通道。
+
+## 要想*正确*恢复，到底得存哪些东西
+
+很容易以为 checkpoint 不就是权重嘛。并不是。一个只恢复权重、别的一概不管的 checkpoint，能让训练*重新跑起来*，却跑的不是*同一次训练*。要想确定性地接着往下跑，下面四样一个都不能少：
+
+- **模型权重**——不用多说，就是参数 $\theta$。
+- **分布式优化器状态**——fp32 的 master 副本，加上 Adam 的一阶、二阶矩 $m, v$。丢了它们，优化器就是冷启动：动量和二阶矩分母全部归零，有效学习率一下子飙上去，每次恢复之后你都会看到一个明显的 loss 抖动，甚至发散。
+- **RNG 状态**——每个 rank 的 PRNG 种子/偏移，再加上 CUDA 的生成器。这一样正是大家最容易漏的。Dropout 掩码、各种随机数据增强、RL rollouts 里的采样——统统由 RNG 驱动。要是拿一个全新的 RNG 恢复，恢复之后的轨迹就会偏离一次没被打断的训练本该走出的路。可复现性——就是那个能帮你判断「到底是我改的代码起了作用，还是纯粹是噪声？」的东西——也就没了；当然，这一切都以你所固定的那些 kernel 和集合通信的确定性为限。
+- **Dataloader / step 位置**——你走到了第几个 step，输入流水线的游标又停在哪里。漏了这个，你要么把已经训过的 batch 再喂一遍（那部分数据被过度加权），要么干脆整块跳过。不管哪种，模型看到的数据分布都跟原定的调度对不上了。
+
+可以这样在脑子里建模：一次训练，是（初始状态、RNG 流、数据顺序）的一个确定性函数。一个正确的 checkpoint，会在中途把*这三样全部*抓下来，好让这个函数能从中间接着算，而不是从头重来。
+
+$$
+\theta_{k+1} \;=\; f\big(\theta_k,\; m_k,\; v_k,\; \text{RNG}_k,\; \text{batch}_k\big)
+$$
+
+只要右边任何一个参数缺失或被重置，恢复后的 $\theta_{k+1}$ 就不是这次训练本该产出的那个 $\theta_{k+1}$。逐比特相等则是更强的要求：它还得有确定性的 kernel，以及固定的规约顺序和 rank 顺序——因为非确定性的 CUDA atomics、cuDNN autotuning、flash-attention 时有变化的规约顺序，还有不同布局下变了的集合通信顺序，都会把它打破。（切换像 TF32 这样的精度模式，并不会引入 run-to-run 的非确定性——固定规约顺序下它是确定性的——但它确实会打破与 fp32 基线之间的逐比特相等。）reshard 到一个新布局，虽然有用，本身也可能改变规约顺序——所以要把「可复现」理解成「在你固定的那些确定性范围内可复现」，而不是一个无条件的保证。
+
+## 自动恢复：最后一道护栏
+
+这一整套东西，图的就是无人值守也能活下来。任务一旦重启——不管什么原因——它都应该自己爬起来，同时对任何可疑的东西坚决不碰：
+
+```python
+# illustrative — not a real implementation
+def recover():
+    candidates = list_checkpoints("s3://ckpts/")        # newest first
+    for ckpt in candidates:
+        if not has_complete_marker(ckpt):               # half-uploaded? skip
+            continue
+        if not index_matches_shards(ckpt):              # missing a shard? skip
+            continue
+        return load_distributed(ckpt)                   # validated; resume here
+    return cold_start()                                 # nothing valid -> step 0
+```
+
+真正挑大梁的是两个想法。第一，**找的是最后一个*完整*的 checkpoint**，而不是最后一个*尝试过*的——如果崩溃发生在上传中途，磁盘上最新的那个前缀就是垃圾，必须跳过。第二，**加载之前先校验完整性**：确认索引在，且它引用的每个 shard 都存在、大小也对得上。加载一个缺了某个 tensor-parallel shard 的 checkpoint，不会当场大声报错；它会以很隐蔽的方式出问题——模型的某一片被悄悄弄错了。`_COMPLETE` 标记，再加一次「索引对照 shard」的核对，就把「最新的那个目录」变成了「最新的*可信*状态」。
+
+## 说到底
+
+大规模下的 checkpointing 是一套可靠性系统，而不是一个「保存」按钮。这些零件拼起来，其实就是一份很简单的契约：
+
+- **分片（Shard）**，让写入并行开来、每个 rank 只承担 $O(S/N)$，而不是全都挤过 rank 0 的 $O(S)$——顺便还能在加载时 reshard。
+- **先暂存到主机内存，再异步落盘、上传到对象存储**，让慢速的远端写跟计算重叠起来，GPU 几乎察觉不到刚做过一次 checkpoint。
+- **权重、分布式优化器状态、RNG、数据位置全都存下来**——四样缺一不可——这样恢复才是确定性的，而不只是「还在跑」。
+- **用完整性检查把恢复自动化**，这样不用人插手，就能找到并加载最后一个*有效*的 checkpoint。
+
+把这件事做对，开头那段动画里的「故障天气」就不再是灾难。一次 OOM、一次 NCCL 超时、一个被回收的节点——每一个都只让你损失掉自上一个完整 checkpoint 以来的那几分钟，而不是整段训练。崩溃还是照旧那么频繁；只是它们再也无关紧要了。

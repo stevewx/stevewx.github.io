@@ -1,0 +1,31 @@
+---
+/**
+ * Mounts a full-bleed canvas behind its container and boots a randomly-chosen
+ * training-themed background scene. Place inside a `relative` parent; the
+ * canvas is absolutely positioned and pointer-transparent.
+ *
+ * Preview a specific scene with
+ * ?fx=token-flow|pipeline|tensor-rain|attention|kv-cache|errors
+ */
+---
+
+<canvas
+  id="fx-bg"
+  class="pointer-events-none absolute inset-0 h-full w-full"
+  aria-hidden="true"
+></canvas>
+
+<script>
+  import { initFx } from "../scripts/fx";
+
+  const canvas = document.getElementById("fx-bg") as HTMLCanvasElement | null;
+  if (canvas) {
+    // The hero text/buttons block marks the "safe area"; structured scenes keep
+    // their labeled content below its bottom edge so nothing overlaps at any
+    // window height. Scoped to the same section as this canvas.
+    const safeArea = canvas
+      .closest("section")
+      ?.querySelector<HTMLElement>("[data-hero-content]");
+    initFx(canvas, safeArea ?? null);
+  }
+</script>

@@ -1,0 +1,89 @@
+---
+import { SITE } from "../consts";
+import ThemeToggle from "./ThemeToggle.astro";
+import LangSwitch from "./LangSwitch.astro";
+import {
+  getLocaleFromPath,
+  localizePath,
+  stripLocale,
+  type Locale,
+} from "../i18n/config";
+import { t } from "../i18n/ui";
+
+interface Props {
+  /** Explicit per-locale language-switch targets, forwarded to LangSwitch. */
+  langSwitchHref?: Partial<Record<Locale, string>>;
+}
+const { langSwitchHref } = Astro.props;
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+const strings = t(locale);
+
+// Locale-agnostic current path for active-state comparison.
+const pathname = stripLocale(Astro.url.pathname).replace(/\/$/, "") || "/";
+
+// Nav items with locale-aware hrefs. Labels come from the dictionary.
+const nav = [
+  { key: "home" as const, path: "/" },
+  { key: "about" as const, path: "/about" },
+  { key: "blog" as const, path: "/blog" },
+].map((item) => ({
+  label: strings.nav[item.key],
+  href: localizePath(item.path, locale),
+  agnostic: item.path,
+}));
+
+function isActive(agnostic: string): boolean {
+  if (agnostic === "/") return pathname === "/";
+  return pathname === agnostic || pathname.startsWith(agnostic + "/");
+}
+
+const homeHref = localizePath("/", locale);
+---
+
+<header
+  class="sticky top-0 z-50 border-b border-ink-800/80 bg-ink-950/70 backdrop-blur-md"
+>
+  <nav
+    class="mx-auto flex h-16 max-w-5xl items-center justify-between px-5"
+    aria-label={strings.a11y.primaryNav}
+  >
+    <a
+      href={homeHref}
+      class="group flex items-center gap-2 font-mono text-sm text-slate-200"
+    >
+      <span
+        class="inline-block h-2 w-2 rounded-full bg-accent shadow-[0_0_12px] shadow-accent/60 group-hover:animate-pulse-slow"
+        aria-hidden="true"></span>
+      <span class="text-slate-500">~/</span><span
+        class="text-slate-100 group-hover:text-accent">{SITE.mark}</span
+      >
+    </a>
+
+    <div class="flex items-center gap-1 sm:gap-2">
+      <ul class="flex items-center gap-1 sm:gap-2">
+        {
+          nav.map((item) => (
+            <li>
+              <a
+                href={item.href}
+                class:list={[
+                  "rounded-md px-3 py-2 text-sm transition-colors",
+                  isActive(item.agnostic)
+                    ? "text-accent"
+                    : "text-slate-400 hover:text-slate-100",
+                ]}
+                aria-current={isActive(item.agnostic) ? "page" : undefined}
+              >
+                {item.label}
+              </a>
+            </li>
+          ))
+        }
+      </ul>
+      <span class="mx-1 h-4 w-px bg-ink-700" aria-hidden="true"></span>
+      <LangSwitch hrefFor={langSwitchHref} />
+      <ThemeToggle />
+    </div>
+  </nav>
+</header>

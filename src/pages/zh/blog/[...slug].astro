@@ -1,0 +1,27 @@
+---
+import { getCollection, render } from "astro:content";
+import type { GetStaticPaths } from "astro";
+import BlogPost from "../../../layouts/BlogPost.astro";
+import { canonicalSlug } from "../../../i18n/content";
+
+// Chinese blog posts only (`<slug>.zh.mdx`). English posts are served by
+// /blog/[...slug]. Until a translation exists, this simply builds no pages for
+// that slug — the blog index falls back to the English version's URL.
+export const getStaticPaths = (async () => {
+  const posts = await getCollection(
+    "blog",
+    (p) => !p.data.draft && p.data.lang === "zh",
+  );
+  return posts.map((post) => ({
+    params: { slug: canonicalSlug(post) },
+    props: { post },
+  }));
+}) satisfies GetStaticPaths;
+
+const { post } = Astro.props;
+const { Content } = await render(post);
+---
+
+<BlogPost post={post}>
+  <Content />
+</BlogPost>

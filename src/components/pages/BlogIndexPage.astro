@@ -1,0 +1,180 @@
+---
+/**
+ * Blog listing body, locale-aware. Renders the full post list server-side for
+ * the active locale (English versions fill in where a translation is missing),
+ * then a client script narrows it by category and tag.
+ */
+import PostCard from "../PostCard.astro";
+import { CATEGORIES } from "../../consts";
+import { getLocaleFromPath } from "../../i18n/config";
+import { t } from "../../i18n/ui";
+import { getPostsWithFallback } from "../../i18n/content";
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+const s = t(locale);
+
+const posts = await getPostsWithFallback(locale);
+
+const tagCounts = new Map<string, number>();
+for (const p of posts) {
+  for (const tag of p.data.tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+}
+const allTags = [...tagCounts.entries()]
+  .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+  .map(([tag]) => tag);
+
+const catLabel = (c: (typeof CATEGORIES)[number]) => s.categories[c];
+---
+
+<div class="mx-auto max-w-5xl px-5 py-16">
+  <p class="kicker mb-3">{s.blog.kicker}</p>
+  <h1 class="text-3xl font-bold text-slate-50 sm:text-4xl">{s.blog.title}</h1>
+  <p class="mt-3 max-w-2xl text-slate-400">{s.blog.intro}</p>
+
+  <div
+    class="mt-8 flex flex-wrap items-center gap-2"
+    role="group"
+    aria-label={s.a11y.filterByCategory}
+    id="category-filter"
+  >
+    <button data-category="all" class="chip chip-active" type="button"
+      >{s.blog.all}</button
+    >
+    {
+      CATEGORIES.map((c) => (
+        <button data-category={c} class="chip" type="button">
+          {catLabel(c)}
+        </button>
+      ))
+    }
+  </div>
+
+  <!-- Tag filter: all tags collapsed by default behind a single toggle. -->
+  {
+    allTags.length > 0 && (
+      <div
+        class="mt-3 flex flex-wrap items-center gap-2"
+        aria-label={s.a11y.filterByTag}
+        id="tag-filter"
+      >
+        <button
+          id="tag-toggle"
+          class="chip text-accent-muted hover:text-accent"
+          type="button"
+          aria-expanded="false"
+          aria-controls="tag-list"
+        >
+          <span>{s.blog.tags}</span>
+          <span class="text-slate-500">({allTags.length})</span>
+          <span id="tag-toggle-caret" aria-hidden="true">▾</span>
+        </button>
+        <span id="tag-list" class="contents">
+          {allTags.map((tag) => (
+            <button data-tag={tag} class="chip hidden" data-tag-chip type="button">
+              #{tag}
+            </button>
+          ))}
+        </span>
+      </div>
+    )
+  }
+
+  <div class="mt-10 grid gap-4 sm:grid-cols-2" id="post-list">
+    {
+      posts.map((post) => (
+        <div
+          class="post-item"
+          data-category={post.data.category}
+          data-tags={post.data.tags.join(",")}
+        >
+          <PostCard post={post} />
+        </div>
+      ))
+    }
+  </div>
+
+  <p id="empty-state" class="mt-10 hidden font-mono text-sm text-slate-500">
+    {s.blog.empty}
+  </p>
+
+  {
+    posts.length === 0 && (
+      <div class="card mt-10 p-8 text-center">
+        <p class="font-mono text-sm text-slate-500">{s.blog.none}</p>
+      </div>
+    )
+  }
+</div>
+
+<script>
+  // Progressive filtering: full list renders server-side; JS only narrows it.
+  const state = { category: "all", tag: null as string | null };
+
+  const items = Array.from(
+    document.querySelectorAll<HTMLElement>(".post-item"),
+  );
+  const empty = document.getElementById("empty-state");
+  const catButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("#category-filter button"),
+  );
+  const tagButtons = Array.from(
+    document.querySelectorAll<HTMLButtonElement>("#tag-filter button[data-tag]"),
+  );
+
+  function apply() {
+    let visible = 0;
+    for (const item of items) {
+      const cat = item.dataset.category ?? "";
+      const tags = (item.dataset.tags ?? "").split(",").filter(Boolean);
+      const catOk = state.category === "all" || cat === state.category;
+      const tagOk = !state.tag || tags.includes(state.tag);
+      const show = catOk && tagOk;
+      item.style.display = show ? "" : "none";
+      if (show) visible++;
+    }
+    if (empty) empty.classList.toggle("hidden", visible !== 0);
+  }
+
+  function setActive(buttons: HTMLButtonElement[], active: HTMLButtonElement) {
+    for (const b of buttons) b.classList.remove("chip-active");
+    active.classList.add("chip-active");
+  }
+
+  for (const btn of catButtons) {
+    btn.addEventListener("click", () => {
+      state.category = btn.dataset.category ?? "all";
+      setActive(catButtons, btn);
+      apply();
+    });
+  }
+
+  for (const btn of tagButtons) {
+    btn.addEventListener("click", () => {
+      const tag = btn.dataset.tag ?? null;
+      if (state.tag === tag) {
+        state.tag = null;
+        btn.classList.remove("chip-active");
+      } else {
+        state.tag = tag;
+        for (const b of tagButtons) b.classList.remove("chip-active");
+        btn.classList.add("chip-active");
+      }
+      apply();
+    });
+  }
+
+  const tagToggle = document.getElementById("tag-toggle");
+  const tagChips = Array.from(
+    document.querySelectorAll<HTMLElement>("#tag-filter [data-tag-chip]"),
+  );
+  const caret = document.getElementById("tag-toggle-caret");
+  if (tagToggle) {
+    let expanded = false;
+    tagToggle.addEventListener("click", () => {
+      expanded = !expanded;
+      for (const chip of tagChips) chip.classList.toggle("hidden", !expanded);
+      tagToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+      if (caret) caret.textContent = expanded ? "▴" : "▾";
+    });
+  }
+</script>

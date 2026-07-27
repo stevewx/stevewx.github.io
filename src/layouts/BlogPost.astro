@@ -1,0 +1,168 @@
+---
+import type { CollectionEntry } from "astro:content";
+import BaseLayout from "./BaseLayout.astro";
+import FormattedDate from "../components/FormattedDate.astro";
+import { SOCIALS } from "../consts";
+import { getLocaleFromPath, localizePath, type Locale } from "../i18n/config";
+import { t } from "../i18n/ui";
+import { canonicalSlug, hasTranslation, postHref } from "../i18n/content";
+
+// Contact CTA on posts points at LinkedIn (email is intentionally not on the site).
+const contact = SOCIALS.find((soc) => soc.label === "LinkedIn" && soc.show);
+
+interface Props {
+  post: CollectionEntry<"blog">;
+}
+const { post } = Astro.props;
+const {
+  title,
+  description,
+  date,
+  updated,
+  category,
+  author,
+  tags,
+  repo,
+  cover,
+  references,
+} = post.data;
+
+const locale = getLocaleFromPath(Astro.url.pathname);
+const s = t(locale);
+const slug = canonicalSlug(post);
+
+// Language switch targets: for each locale, link to the translated post if it
+// exists, else fall back to that locale's blog index (no dead links).
+const otherLocale: Locale = locale === "en" ? "zh" : "en";
+const otherHasIt = await hasTranslation(slug, otherLocale);
+const hrefFor: Partial<Record<Locale, string>> = {
+  [locale]: postHref(post),
+  [otherLocale]: otherHasIt
+    ? localizePath(`/blog/${slug}`, otherLocale)
+    : localizePath("/blog", otherLocale),
+};
+
+const blogHref = localizePath("/blog", locale);
+---
+
+<BaseLayout
+  title={`${title} — ${s.site.name}`}
+  description={description}
+  image={cover}
+  article={true}
+  langSwitchHref={hrefFor}
+>
+  <article class="mx-auto max-w-prose px-5 py-16">
+    <a href={blogHref} class="font-mono text-xs text-slate-500 hover:text-accent"
+      >{s.post.allWriteups}</a
+    >
+
+    <header class="mt-6">
+      <div class="flex flex-wrap items-center gap-3 text-xs">
+        <span class="font-mono text-accent-muted">{s.categories[category]}</span>
+        <span class="text-slate-600">·</span>
+        <FormattedDate date={date} class="font-mono text-slate-500" />
+        {
+          updated && (
+            <>
+              <span class="text-slate-600">·</span>
+              <span class="font-mono text-slate-500">
+                {s.post.updated} <FormattedDate date={updated} />
+              </span>
+            </>
+          )
+        }
+      </div>
+
+      <h1 class="mt-3 text-3xl font-bold leading-tight text-slate-50 sm:text-4xl">
+        {title}
+      </h1>
+
+      <p class="mt-3 font-mono text-sm text-slate-500">
+        {s.post.by}
+        {author}
+      </p>
+
+      <p class="mt-3 text-lg text-slate-400">{description}</p>
+
+      <div class="mt-5 flex flex-wrap items-center gap-3">
+        {
+          tags.map((tag) => (
+            <a href={`${blogHref}?tag=${tag}`} class="chip text-[11px]">
+              #{tag}
+            </a>
+          ))
+        }
+        {
+          repo && (
+            <a
+              href={repo}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="chip text-[11px] hover:border-accent-dim hover:text-accent"
+            >
+              {s.post.repo}
+            </a>
+          )
+        }
+      </div>
+    </header>
+
+    <hr class="my-8 border-ink-800" />
+
+    <div
+      class="prose max-w-none prose-headings:scroll-mt-24 prose-headings:font-semibold prose-a:text-accent prose-a:no-underline hover:prose-a:underline prose-code:rounded prose-code:bg-ink-800 prose-code:px-1.5 prose-code:py-0.5 prose-code:font-mono prose-code:text-accent prose-code:before:content-[''] prose-code:after:content-[''] prose-pre:border prose-pre:border-ink-700 prose-pre:bg-ink-900 prose-blockquote:border-l-accent-dim prose-blockquote:text-slate-400 prose-strong:text-slate-100 prose-img:rounded-lg prose-img:border prose-img:border-ink-700"
+    >
+      <slot />
+    </div>
+
+    {
+      references.length > 0 && (
+        <section class="mt-12 border-t border-ink-800 pt-8">
+          <p class="kicker mb-4">{s.post.references}</p>
+          <ol class="space-y-3">
+            {references.map((ref, i) => (
+              <li class="flex gap-3 text-sm">
+                <span class="font-mono text-slate-600">[{i + 1}]</span>
+                <span class="text-slate-400">
+                  {ref.authors && (
+                    <span class="text-slate-500">{ref.authors}. </span>
+                  )}
+                  <a
+                    href={ref.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-accent hover:underline"
+                  >
+                    {ref.title}
+                  </a>
+                  {ref.note && <span class="text-slate-500"> — {ref.note}</span>}
+                </span>
+              </li>
+            ))}
+          </ol>
+        </section>
+      )
+    }
+
+    {
+      contact && (
+        <aside class="mt-12 space-y-3 rounded-lg border border-ink-700 bg-ink-900/60 p-5">
+          <p class="text-sm text-slate-300">
+            {s.post.asideQuestion}
+            <a
+              href={contact.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="text-accent hover:underline"
+            >
+              {s.post.asideReachLink}
+            </a>
+            {locale === "zh" ? "。" : "."}
+          </p>
+          <p class="text-sm text-slate-400">{s.post.asideShare}</p>
+        </aside>
+      )
+    }
+  </article>
+</BaseLayout>
